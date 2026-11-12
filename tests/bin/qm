@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Faux `qm` Proxmox pour le banc : VM 105 « haos-centrale », IP lue dans HAB_TEST_VM_IP."""
+import json, os, sys
+log = os.environ.get("HAB_TEST_QM_LOG", "/tmp/qm.log")
+open(log, "a").write(" ".join(sys.argv[1:]) + "\n")
+a = sys.argv[1:]
+if a[:1] == ["list"]:
+    print("      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID")
+    print("       100 yunohost             running    4096              32.00 1111")
+    print("       105 haos-centrale        running    4096              64.00 2222")
+elif a[:2] == ["guest", "cmd"]:
+    ip = os.environ.get("HAB_TEST_VM_IP", "127.0.0.1")
+    print(json.dumps([
+        {"name": "lo", "ip-addresses": [{"ip-address": "127.0.0.1", "ip-address-type": "ipv4"}]},
+        {"name": "enp0s18", "ip-addresses": [{"ip-address": ip, "ip-address-type": "ipv4"},
+                                             {"ip-address": "fe80::1", "ip-address-type": "ipv6"}]},
+        {"name": "hassio", "ip-addresses": [{"ip-address": "172.30.32.1", "ip-address-type": "ipv4"}]},
+        {"name": "docker0", "ip-addresses": [{"ip-address": "172.30.232.1", "ip-address-type": "ipv4"}]}]))
+elif a[:1] == ["snapshot"]:
+    if os.environ.get("HAB_TEST_SNAP_FAIL"):
+        print("snapshot feature is not available", file=sys.stderr); sys.exit(1)
+    print(f"snapshot {a[2]} ok")
+elif a[:1] == ["start"]:
+    pass
+else:
+    print("qm simulé : commande inconnue", a, file=sys.stderr); sys.exit(1)

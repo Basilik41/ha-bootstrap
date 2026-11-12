@@ -1,0 +1,2 @@
+{"domain": "remote_homeassistant", "name": "Remote HA (simulé)", "codeowners": [], "config_flow": false,
+ "documentation": "https://example.invalid", "iot_class": "local_push", "requirements": [], "version": "4.5"}

@@ -1,0 +1,3 @@
+{"domain": "marketplace", "name": "Marketplace (simulée)", "codeowners": [], "config_flow": true,
+ "dependencies": ["http", "websocket_api"], "documentation": "https://example.invalid", "iot_class": "cloud_polling",
+ "requirements": [], "single_config_entry": true, "version": "2026.11.1"}

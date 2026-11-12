@@ -1,0 +1,2 @@
+{"domain": "hacs", "name": "HACS (simulé)", "codeowners": [], "config_flow": true, "dependencies": ["http", "websocket_api"],
+ "documentation": "https://example.invalid", "iot_class": "cloud_polling", "requirements": [], "version": "2.0.5"}
