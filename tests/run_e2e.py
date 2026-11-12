@@ -350,6 +350,8 @@ def grange_setup():
         g.req("POST", f"/api/onboarding/{step}", json_body={})
     g.req("POST", "/api/onboarding/integration", json_body={"client_id": g.client_id, "redirect_uri": g.redirect})
     g.call("config/core/update", location_name="Grange")
+    if (g.call("http/config") or {}).get("pending"):  # le port 8124 du YAML est « à l'essai » : sinon retour au 8123 après 5 min
+        g.call("http/config/promote")
     f = g.flow_start("remote_homeassistant")
     g.flow_step(f["flow_id"], {"type": "Setup as remote node"})
     return g
@@ -425,6 +427,46 @@ def scenario_liaisons():
     users3 = [u for u in g.call("config/auth/list") if (u.get("username") or "").startswith("liaison-")]
     check("[liaisons] reprise après essai interrompu : ancien jeton remplacé, liaison recréée, un seul compte",
           titles == ["Grange"] and len(users3) == 1 and "already exists" not in out, out[-700:])
+    # liaison refaite vers une autre adresse : liste blanche gardée, mise à jour sur place
+    hw = ha_session()
+    e = hw.entries("remote_homeassistant")[0]
+    for _ in range(20):
+        st, r = hw.req("POST", "/api/config/config_entries/options/flow", json_body={"handler": e["entry_id"]})
+        if isinstance(r, dict) and r.get("flow_id"):
+            break
+        print("    (options pas encore prêtes :", st, str(r)[:120], ")")
+        time.sleep(3)
+    fid = r["flow_id"]
+    r = hw.req("POST", f"/api/config/config_entries/options/flow/{fid}",
+               json_body={"entity_prefix": "grange_", "service_prefix": "grange_"})[1]
+    r = hw.req("POST", f"/api/config/config_entries/options/flow/{fid}",
+               json_body={"include_entities": ["input_boolean.alarme_grange"]})[1]
+    r = hw.req("POST", f"/api/config/config_entries/options/flow/{fid}", json_body={"filter": []})[1]
+    r = hw.req("POST", f"/api/config/config_entries/options/flow/{fid}", json_body={"subscribe_events": []})[1]
+    check("[refaire] liste blanche posée sur la liaison (comme le ferait Claude)", r.get("type") == "create_entry", json.dumps(r)[:300])
+    time.sleep(6)
+    before_ids = [x["entry_id"] for x in hw.entries("remote_homeassistant")]
+    imported_before = hw.req("GET", "/api/states/input_boolean.grange_alarme_grange")[0]
+    hw.ws_close()
+    out = run_script("refaire", dict(answers, **{"liaison.known": [], "liaison.add": [True, False],
+                                                 "liaison.url": "http://localhost:8124", "liaison.replace": True}),
+                     args=["--liaisons"])
+    hw = ha_session()
+    ents = hw.entries("remote_homeassistant")
+    entries = json.load(open(os.path.join(CFG, ".storage", "core.config_entries")))["data"]["entries"]
+    stored = next(x for x in entries if x["domain"] == "remote_homeassistant")
+    check("[refaire] même liaison mise à jour sur place (pas de nouvelle)", [x["entry_id"] for x in ents] == before_ids
+          and ents[0]["title"] == "Grange" and ents[0]["state"] == "loaded", json.dumps(ents)[:300])
+    check("[refaire] nouvelle adresse et nouveau jeton enregistrés", stored["data"].get("host") == "localhost",
+          json.dumps(stored["data"])[:200])
+    check("[refaire] liste blanche et préfixe gardés à l'identique",
+          stored["options"].get("include_entities") == ["input_boolean.alarme_grange"]
+          and stored["options"].get("entity_prefix") == "grange_", json.dumps(stored["options"]))
+    time.sleep(5)
+    check("[refaire] entité de la liste blanche toujours là, même nom", imported_before == 200 and
+          hw.req("GET", "/api/states/input_boolean.grange_alarme_grange")[0] == 200)
+    check("[refaire] bilan clair", "Grange refaite vers http://localhost:8124" in out, out[-700:])
+    hw.ws_close()
     ha.ws_close()
     g.ws_close()
 

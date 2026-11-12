@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -2199,7 +2199,7 @@ class Bootstrap:
         cands = self.discover_instances()
         add_more = not cands
         if cands:
-            items = [(base, label + (" — déjà reliée" if label.split(" ·")[0] in titles else ""),
+            items = [(base, label + (" — déjà reliée (cocher pour la refaire)" if label.split(" ·")[0] in titles else ""),
                       label.split(" ·")[0] not in titles and "· VM" not in label)
                      for base, label in cands.items()]
             items.append(("+", "➕ Ajouter une autre adresse…", False))
@@ -2242,9 +2242,15 @@ class Bootstrap:
             links[inst["uuid"] or inst["name"]] = {"name": inst["name"], "base": inst["base"], "account": inst["account"],
                                                     "prefix": inst["entity_prefix"]}
         self.save_conf()
-        self.next_steps.append(
-            "Liaisons créées SANS rien importer (filtre restrictif). Choisis ce que cette instance doit voir : "
-            "Paramètres → Intégrations → Remote Home-Assistant → Configurer, ou demande-le à Claude.")
+        if any(not i.get("keep") for i in instances):
+            self.next_steps.append(
+                "Liaisons créées SANS rien importer (filtre restrictif). Choisis ce que cette instance doit voir : "
+                "Paramètres → Intégrations → Remote Home-Assistant → Configurer, ou demande-le à Claude.")
+        for i in instances:
+            if i.get("keep"):
+                self.next_steps.append(f"{i['name']} : la liaison utilise maintenant le compte « {i['account']} ». "
+                                       f"Si l'ancienne utilisait un autre compte (ex. « Liaison ») sur {i['name']}, "
+                                       "son ancien jeton ne sert plus : supprime-le dans le profil de ce compte → Sécurité.")
         self.next_steps.append("Couper une liaison : supprime le compte " + ", ".join(
             sorted({f"« {i['account']} » sur {i['name']}" for i in instances})) + " (Paramètres → Personnes → Utilisateurs).")
         return ", ".join(made + done)
@@ -2332,8 +2338,18 @@ class Bootstrap:
             if not me.get("is_admin"):
                 raise HAError("liaison", f"{user} n'est pas administrateur de {base}")
             name = r.config().get("location_name") or base
+            keep = None
             if name in titles:
-                return {"name": name, "already": True}
+                if not self.ui.yesno("liaison.replace", f"« {name} » est déjà reliée",
+                                     f"Cette instance a déjà une liaison « {name} ».\n\n"
+                                     f"La refaire vers {base}, avec un compte dédié et un jeton neuf ?\n"
+                                     "Sa liste blanche, son préfixe et ses réglages sont gardés à l'identique\n"
+                                     "(les entités gardent leurs noms : rien ne casse dans les tableaux de bord).",
+                                     default=False):
+                    return {"name": name, "already": True}
+                entry = next(e for e in self.ha.entries("remote_homeassistant")
+                             if e.get("title", "").removesuffix(" (YAML)") == name)
+                keep = self.read_rha_options(entry["entry_id"])
             uuid = self.instance_uuid(r)
             if not uuid:
                 uuid = self.link_enable_remote(r, base, name)
@@ -2376,11 +2392,75 @@ class Bootstrap:
             t.ws_close()
             self.ui.ok(f"{name} : compte « {account} » ({'réseau local seulement' if local_only else 'accès Internet permis'}) et jeton créés")
             prefix = slugify(name).replace("-", "_") + "_"
+            if keep and keep.get("entity_prefix") is not None:
+                prefix = keep["entity_prefix"]
             return {"name": name, "base": base, "uuid": uuid, "account": account, "host": u.hostname,
                     "port": u.port or (443 if u.scheme == "https" else 80), "secure": u.scheme == "https",
-                    "token": token, "entity_prefix": prefix}
+                    "token": token, "entity_prefix": prefix, "keep": keep}
         finally:
             r.ws_close()
+
+    def rha_guard(self) -> None:
+        """Remote HA 4.6 plante au déchargement si le cache des descriptions de services n'existe pas encore
+        (KeyError 'service_description_cache' sur HA 2026.11) : la liaison reste cassée jusqu'au redémarrage.
+        Demander la liste des services crée ce cache, comme le fait l'interface quand on l'ouvre."""
+        try:
+            self.ha.call("get_services", wait=120)
+        except Exception as ex:  # pas bloquant
+            LOG.write(f"get_services : {ex}")
+
+    def read_rha_options(self, entry_id: str) -> dict:
+        """Relit les réglages d'une liaison Remote HA en parcourant son assistant d'options, puis l'abandonne."""
+        def defaults(r):
+            out = {}
+            for f in (r or {}).get("data_schema") or []:
+                v = f.get("default")
+                if v is None:
+                    v = (f.get("description") or {}).get("suggested_value")
+                if v is not None:
+                    out[f["name"]] = v
+            return out
+        self.rha_guard()
+        for _ in range(10):  # la liaison vient peut-être de (re)démarrer
+            s, r = self.ha.req("POST", "/api/config/config_entries/options/flow",
+                               json_body={"handler": entry_id, "show_advanced_options": False}, timeout=60)
+            if s == 200 and isinstance(r, dict) and r.get("type") == "form":
+                break
+            time.sleep(3)
+        if s != 200 or not isinstance(r, dict) or r.get("type") != "form":
+            raise HAError("liaison", f"réglages de la liaison illisibles (est-elle connectée ?) : {r}")
+        fid = r["flow_id"]
+        opts: dict = {}
+        try:
+            d1 = defaults(r)
+            opts.update(d1)
+
+            def step(data):
+                st, res = self.ha.req("POST", f"/api/config/config_entries/options/flow/{fid}", json_body=data, timeout=60)
+                if st != 200 or not isinstance(res, dict) or res.get("type") != "form":
+                    raise HAError("liaison", f"lecture des réglages interrompue : {res}")
+                return res
+            r2 = step(d1)
+            d2 = defaults(r2)
+            opts.update(d2)
+            r3 = step(d2)
+            d3 = defaults(r3)
+            filters = []
+            for item in d3.get("filter") or []:
+                m = re.match(r"^\d+\. (.*), unit: (.*), above: (.*), below: (.*)$", item)
+                if m:
+                    f = {}
+                    for k, v in zip(("entity_id", "unit_of_measurement", "above", "below"), m.groups()):
+                        if v not in ("None", ""):
+                            f[k] = float(v) if k in ("above", "below") else v
+                    if f:
+                        filters.append(f)
+            opts["filter"] = filters
+            r4 = step({"filter": d3.get("filter") or []})
+            opts["subscribe_events"] = defaults(r4).get("subscribe_events") or []
+        finally:
+            self.ha.flow_abort(fid, options=True)
+        return opts
 
     def link_enable_remote(self, r: "HA", base: str, name: str) -> str | None:
         """L'autre instance n'expose pas encore Remote HA : l'installer et l'activer (avec accord)."""
@@ -2422,9 +2502,24 @@ class Bootstrap:
         for i in instances:
             lines += [f"  - host: {yaml_str(i['host'])}", f"    port: {i['port']}",
                       f"    secure: {'true' if i['secure'] else 'false'}", "    verify_ssl: false",
-                      f"    access_token: {yaml_str(i['token'])}", f"    entity_prefix: {yaml_str(i['entity_prefix'])}",
-                      f"    service_prefix: {yaml_str(i['entity_prefix'])}",
-                      "    include:", f"      entities: [{NOTHING_ENTITY}]"]
+                      f"    access_token: {yaml_str(i['token'])}", f"    entity_prefix: {yaml_str(i['entity_prefix'])}"]
+            k = i.get("keep")
+            if k:  # liaison refaite : tous ses réglages actuels, à l'identique
+                lines.append(f"    service_prefix: {yaml_str(k.get('service_prefix') or i['entity_prefix'])}")
+                if k.get("entity_friendly_name_prefix"):
+                    lines.append(f"    entity_friendly_name_prefix: {yaml_str(k['entity_friendly_name_prefix'])}")
+                for key in ("load_components", "services", "subscribe_events"):
+                    if k.get(key):
+                        lines.append(f"    {key}: {json.dumps(k[key])}")
+                lines += ["    include:", f"      entities: {json.dumps(k.get('include_entities') or [])}",
+                          f"      domains: {json.dumps(k.get('include_domains') or [])}",
+                          "    exclude:", f"      entities: {json.dumps(k.get('exclude_entities') or [])}",
+                          f"      domains: {json.dumps(k.get('exclude_domains') or [])}"]
+                if k.get("filter"):
+                    lines.append(f"    filter: {json.dumps(k['filter'])}")
+            else:
+                lines += [f"    service_prefix: {yaml_str(i['entity_prefix'])}",
+                          "    include:", f"      entities: [{NOTHING_ENTITY}]"]
         text = "\n".join(lines) + "\n"
         before = {e["entry_id"] for e in self.ha.entries("remote_homeassistant")}
         out = self.file_editor_python(LIAISON_YAML, {"action": "add", "yaml": text})
@@ -2436,23 +2531,32 @@ class Bootstrap:
                 raise HAError("liaison", f"configuration refusée : {chk}")
             self.ha.restart("création des liaisons")
             new = []
+            fresh = [i for i in instances if not i.get("keep")]
             for _ in range(30):
                 new = [e for e in self.ha.entries("remote_homeassistant") if e["entry_id"] not in before]
-                if len(new) >= len(instances):
+                if len(new) >= len(fresh):
                     break
                 time.sleep(3)
+            time.sleep(5)  # une liaison refaite est rechargée après sa mise à jour
         finally:
             self.file_editor_python(LIAISON_YAML, {"action": "remove"})  # jeton retiré des fichiers
         made = []
+        self.rha_guard()  # renommer recharge la liaison
         for e in new:
             title = e.get("title", "").removesuffix(" (YAML)")
             if title != e.get("title"):
                 self.ha.call("config_entries/update", entry_id=e["entry_id"], title=title)
             made.append(f"{title} reliée ({e.get('state')})")
-        missing = len(instances) - len(new)
+        for i in instances:
+            if i.get("keep"):
+                e = next((x for x in self.ha.entries("remote_homeassistant")
+                          if x.get("title", "").removesuffix(" (YAML)") == i["name"]), None)
+                made.append(f"{i['name']} refaite vers {i['base']} ({(e or {}).get('state')}), réglages gardés")
+        missing = len(fresh) - len(new)
         if missing:
             raise HAError("liaison", f"{missing} liaison(s) non créée(s) : regarde le journal de Home Assistant")
-        self.ui.ok("Liaisons créées, rien importé tant que la liste blanche n'est pas choisie")
+        if fresh:
+            self.ui.ok("Liaisons créées, rien importé tant que la liste blanche n'est pas choisie")
         return made
 
     # -- Accès distant --
