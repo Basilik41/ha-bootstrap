@@ -37,7 +37,8 @@ def accès_distant_expr(host, webhook):
 
 def fresh_state():
     return {
-        "token": "cf-good-token", "missing": [], "rule_limit": 10, "gh_token": "gh-good-token",
+        "token": "cf-good-token", "missing": [], "rule_limit": 10, "gh_token": "gh-good-token", "no_sbfm": False,
+        "client_certs": [],
         "zone": {"id": "zone0123456789abcdef", "name": ZONE, "account": {"id": "acc0123456789"}},
         "mtls": [f"ha.{ZONE}"],
         "tunnels": {}, "dns": [],
@@ -204,6 +205,22 @@ class H(BaseHTTPRequestHandler):
             if method == "PUT":
                 STATE["mtls"] = list(self._body()["hostnames"])
             return self.ok({"hostnames": STATE["mtls"]})
+        if path == zp + "/client_certificates" and method == "POST":
+            if not self.perm("ssl"):
+                return
+            csr = self._body()["csr"]
+            import subprocess, tempfile
+            with tempfile.TemporaryDirectory() as t:
+                open(f"{t}/r.csr", "w").write(csr)
+                r = subprocess.run(["openssl", "x509", "-req", "-in", f"{t}/r.csr", "-CA", CA_CRT, "-CAkey", CA_KEY,
+                                    "-CAcreateserial", "-CAserial", f"{t}/s", "-days", "3650", "-out", f"{t}/c.crt"],
+                                   capture_output=True, text=True)
+                if r.returncode:
+                    return self.err(400, 1400, "CSR invalide : " + r.stderr[-200:])
+                cert = open(f"{t}/c.crt").read()
+            rec = {"id": "cc-" + secrets.token_hex(4), "certificate": cert, "status": "active"}
+            STATE["client_certs"].append(rec)
+            return self.ok(rec)
         if path == zp + "/rulesets":
             if not self.perm("waf"):
                 return
@@ -212,6 +229,14 @@ class H(BaseHTTPRequestHandler):
         if path == zp + "/rulesets/phases/http_request_firewall_custom/entrypoint":
             if not self.perm("waf"):
                 return
+            if method == "PUT":
+                rules = self._body()["rules"]
+                bad = self._bad_skip(rules)
+                if bad:
+                    return bad
+                STATE["ruleset"] = {"id": "rs_new_" + secrets.token_hex(3), "phase": "http_request_firewall_custom",
+                                    "rules": [dict(r, id="r" + secrets.token_hex(4)) for r in rules]}
+                return self.ok(STATE["ruleset"])
             if STATE["ruleset"] is None:
                 return self.err(404, 10003, "could not find entrypoint ruleset")
             return self.ok(STATE["ruleset"])
@@ -225,11 +250,16 @@ class H(BaseHTTPRequestHandler):
             if method == "POST":
                 if len(rules) >= STATE["rule_limit"]:
                     return self.err(400, 20217, "exceeded maximum number of rules in the phase http_request_firewall_custom: 5 out of 5")
+                bad = self._bad_skip([b])
+                if bad:
+                    return bad
                 pos = b.pop("position", None)
                 rule = dict(b, id="r" + secrets.token_hex(4))
                 if pos and "after" in pos:
                     i = next(i for i, r in enumerate(rules) if r["id"] == pos["after"])
                     rules.insert(i + 1, rule)
+                elif pos and "index" in pos:
+                    rules.insert(pos["index"] - 1, rule)
                 else:
                     rules.append(rule)
                 return self.ok(rs)
@@ -238,6 +268,12 @@ class H(BaseHTTPRequestHandler):
                 r.update(b)
                 return self.ok(rs)
         self.err(404, 7003, f"route simulée inconnue : {method} {path}")
+
+    def _bad_skip(self, rules):
+        if STATE["no_sbfm"] and any("http_request_sbfm" in (r.get("action_parameters") or {}).get("phases", []) for r in rules):
+            self.err(400, 20120, "phase http_request_sbfm is not available for this zone plan")
+            return True
+        return False
 
     # ── GitHub ──
     def gh(self, method, path):
@@ -258,11 +294,21 @@ class H(BaseHTTPRequestHandler):
         exists = any(r["name"] == host for r in STATE["dns"])
         if not exists:
             return self._send(530, b"origin DNS error", "text/plain")
-        self._send(403 if protected else 200, b"{}")
+        geo = any(r["action"] == "block" and f'http.host eq "{host}"' in r["expression"] and "cf.tls_client_auth" not in r["expression"]
+                  for r in (STATE["ruleset"] or {"rules": []})["rules"])
+        self._send(403 if protected or geo else 200, b"{}")
+
+
+CA_KEY = CA_CRT = ""
 
 
 def main():
-    global TARBALL
+    global TARBALL, CA_KEY, CA_CRT
+    import subprocess, tempfile
+    t = tempfile.mkdtemp()
+    CA_KEY, CA_CRT = f"{t}/ca.key", f"{t}/ca.crt"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", CA_KEY, "-out", CA_CRT,
+                    "-days", "3650", "-subj", "/CN=Cloudflare Managed CA (banc)"], check=True, capture_output=True)
     port = int(sys.argv[1])
     TARBALL = make_tarball(sys.argv[2])
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)

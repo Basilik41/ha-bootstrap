@@ -158,8 +158,10 @@ def scenario_fresh():
         "owner_intro": "ok", "owner_name": "Richard", "owner_username": "richard",
         "owner_password": PWD, "owner_password2": PWD,
         "profile": "centrale", "instance_name": "Centrale",
+        "steps": ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "remote_ha", "cloudflare"],
         "coords": "47.6012, 1.3335",
-        "user.Julie": "julie",
+        "people.add": [True, False], "people.name": "Julie", "people.username": "julie",
+        "people.admin": False, "people.remote": True,
         "store_warning": True, "github_code": "ok",
         "github_token": ["mauvais-jeton", "gh-good-token"], "remember.github_token": True,
         "cf_token": "cf-good-token", "remember.cloudflare_token": True,
@@ -283,7 +285,7 @@ def scenario_rerun():
     answers = {
         "target": "105", "snapshot_before": False,
         "login_password": PWD,
-        "profile": "centrale",
+        "profile": "centrale", "people.add": False,
         "summary": "ok", "snapshot_after": False,
     }
     out = run_script("relance", answers)
@@ -344,14 +346,85 @@ def scenario_failures():
     check("[échec] pas de tunnel ouvert sans règle", len(cloud()["tunnels"]) == 1)
     cloud("/test/set", {"rule_limit": 10})
 
-    # d) aucune règle modèle → refus explicite, pas de tunnel ouvert sans protection
-    cloud("/test/set", {"ruleset": None})
+    # d) chez un ami : zone sans aucune règle, offre sans Super Bot Fight, certificats créés par le script
+    cloud("/test/set", {"ruleset": None, "mtls": [], "no_sbfm": True})
+    answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "principal",
+               "instance_name": "Chez Paul", "steps": ["ha_mcp", "cloudflare"], "host": "ha-paul.degest.test",
+               "waf_confirm": True, "cert.add": [True, True, False], "cert.name": ["telephone-paul", "pc-paul"],
+               "summary": "ok", "secrets": "ok", "snapshot_after": False}
+    out = run_script("ami", answers)
+    s = cloud()
+    rules = (s["ruleset"] or {}).get("rules") or []
+    conf = json.load(open(os.path.join(CONF, "config.json")))
+    wpath = conf.get("webhook.chez-paul")
+    check("[ami] deux règles créées de zéro (certificat obligatoire, puis Claude)",
+          [r["description"] for r in rules] == ["Certificat obligatoire ha-paul.degest.test — ha-bootstrap",
+                                                "Claude ha-paul.degest.test — ha-bootstrap"], json.dumps(rules)[:400])
+    b = rules[0]["expression"] if rules else ""
+    check("[ami] règle générée : certificat vérifié et non révoqué, /auth/token, webhook de l'instance",
+          'http.host eq "ha-paul.degest.test"' in b and "cf.tls_client_auth.cert_verified and not cf.tls_client_auth.cert_revoked" in b
+          and '"/auth/token"' in b and wpath and f'eq "{wpath}"' in b, b)
+    check("[ami] offre sans Super Bot Fight : saut des seules règles personnalisées",
+          len(rules) == 2 and rules[1]["action_parameters"] == {"ruleset": "current"})
+    check("[ami] certificat client demandé sur l'hôte", s["mtls"] == ["ha-paul.degest.test"])
+    check("[ami] contrôle : refusé sans certificat", "refusé sans certificat" in out)
+    d = os.path.join(CONF, "certificats", "ha-paul.degest.test")
+    files = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    check("[ami] deux fichiers .p12, aucune clé laissée en clair", files == ["pc-paul.crt", "pc-paul.p12", "telephone-paul.crt",
+                                                                             "telephone-paul.p12"], str(files))
+    import re as _re
+    ok_p12 = True
+    for n in ("telephone-paul", "pc-paul"):
+        m = _re.search(rf"Certificat {n} \([^)]*\) :\n\s+(\S+)", out)
+        f = os.path.join(d, f"{n}.p12")
+        r = subprocess.run(["openssl", "pkcs12", "-in", f, "-passin", f"pass:{m.group(1) if m else 'x'}", "-nokeys"],
+                           capture_output=True, text=True) if os.path.exists(f) else None
+        ok_p12 &= bool(m and r and r.returncode == 0 and "BEGIN CERTIFICATE" in r.stdout
+                       and stat.S_IMODE(os.stat(f).st_mode) == 0o600)
+    check("[ami] .p12 lisibles avec le mot de passe affiché (600)", ok_p12)
+    check("[ami] certificats signés par l'autorité Cloudflare", len(s["client_certs"]) == 2)
+    leaks = [f for f in os.listdir(os.path.join(CONF, "logs"))
+             if _re.search(r"Certificat telephone-paul \([^)]*\) :\n\s+[A-Za-z0-9]{12}\b", open(os.path.join(CONF, "logs", f)).read())]
+    check("[ami] mot de passe des certificats absent des journaux", not leaks, str(leaks))
+
+    # d2) accès par mot de passe seulement : pas de règle, pas de certificat, joignable
+    before = cloud()
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "perso",
-               "instance_name": "Quatre", "steps": ["cloudflare"], "host": "ha-quatre.degest.test",
-               "error.cloudflare": "skip", "summary": "ok", "snapshot_after": False}
-    out = run_script("sansmodele", answers)
-    check("[échec] sans règle modèle : refus explicite", "aucune règle mTLS existante" in out, out[-1200:])
-    check("[échec] sans règle modèle : aucun tunnel ouvert", len(cloud()["tunnels"]) == 1)
+               "instance_name": "Libre", "steps": ["cloudflare"], "host": "ha-libre.degest.test", "cf_mode": "login",
+               "summary": "ok", "snapshot_after": False}
+    out = run_script("libre", answers)
+    after = cloud()
+    check("[libre] aucune règle ni certificat ajouté", after["ruleset"] == before["ruleset"] and after["mtls"] == before["mtls"])
+    check("[libre] joignable avec le mot de passe Home Assistant", "joignable (mot de passe Home Assistant)" in out, out[-600:])
+    check("[libre] aucune question de certificat", "Certificats des appareils" not in out)
+    cloud("/test/set", {"no_sbfm": False})
+
+    # h) comptes : reprise des personnes d'une instance précédente, puis locataire
+    cp = os.path.join(CONF, "config.json")
+    c = json.load(open(cp))
+    c["people"].append({"name": "Paul", "username": "paul", "admin": True, "local_only": False})
+    json.dump(c, open(cp, "w"))
+    answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "principal",
+               "instance_name": "Centrale", "steps": ["users"], "people.reuse": True, "people.add": False,
+               "summary": "ok", "secrets": "ok", "snapshot_after": False}
+    out = run_script("reprise", answers)
+    ha = ha_session()
+    users = {u["username"]: u for u in ha.call("config/auth/list") if u.get("username")}
+    check("[reprise] Paul repris de l'instance précédente, administrateur", "paul" in users
+          and "system-admin" in users["paul"]["group_ids"] and "créés : paul" in out, out[-600:])
+    answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "location",
+               "instance_name": "Centrale", "steps": ["users"], "people.add": [True, False], "people.name": "Martin",
+               "people.username": ["locataire", "martin-appart"], "people.remote": True,
+               "summary": "ok", "secrets": "ok", "snapshot_after": False}
+    out = run_script("locataire", answers)
+    users = {u["username"]: u for u in ha.call("config/auth/list") if u.get("username")}
+    check("[locataire] identifiant générique refusé", "Trop générique" in out)
+    check("[locataire] compte créé, non administrateur, avec sa personne", "martin-appart" in users
+          and users["martin-appart"]["group_ids"] == ["system-users"]
+          and any(p["name"] == "Martin" for p in ha.call("person/list")["storage"]))
+    check("[locataire] pas mémorisé pour les instances suivantes",
+          not any(p["username"] == "martin-appart" for p in json.load(open(cp))["people"]))
+    ha.ws_close()
 
     # f) mises à jour disponibles (Supervisor, Core, OS) : appliquées dans l'ordre, attente des redémarrages
     for n in ("supervisor", "core", "os"):

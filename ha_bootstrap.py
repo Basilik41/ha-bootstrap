@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -50,41 +50,42 @@ USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
 HOST_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 PROFILES = {
-    "centrale": {
-        "label": "Centrale (Richard et Julie, lit les autres instances)",
-        "name": "Centrale", "slug": "centrale",
-        "steps": ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "remote_ha", "cloudflare"],
-        "people": [{"name": "Julie", "username": "julie", "admin": False}],
-    },
-    "bien": {
-        "label": "Bien loué (locataire, données remontées vers la centrale)",
-        "name": "Bien loué", "slug": "bien",
-        "steps": ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "cloudflare"],
-        "people": [{"name": "Locataire", "username": "", "admin": False, "tenant": True}],
-    },
     "principal": {
-        "label": "Maison ou bâtiment de la famille",
-        "name": "Maison", "slug": "maison",
-        "steps": ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "remote_ha", "cloudflare"],
-        "people": [{"name": "Julie", "username": "julie", "admin": False}],
+        "label": "Maison principale (la famille, les appareils de la maison)",
+        "name": "Maison", "tenant": False,
+        "steps": ["general", "updates", "users", "hacs", "cloudflare"],
+    },
+    "secondaire": {
+        "label": "Autre bâtiment ou résidence secondaire",
+        "name": "Résidence secondaire", "tenant": False,
+        "steps": ["general", "updates", "users", "hacs", "cloudflare"],
+    },
+    "location": {
+        "label": "Logement loué (compte du locataire, séparé du reste)",
+        "name": "Location", "tenant": True,
+        "steps": ["general", "updates", "users", "hacs", "cloudflare"],
+    },
+    "centrale": {
+        "label": "Centrale (regarde plusieurs autres instances)",
+        "name": "Centrale", "tenant": False,
+        "steps": ["general", "updates", "users", "hacs", "remote_ha", "cloudflare"],
     },
     "perso": {
-        "label": "Personnalisé (je choisis tout)",
-        "name": "Home Assistant", "slug": "ha",
-        "steps": ["general", "updates", "users", "hacs", "ha_mcp"],
-        "people": [],
+        "label": "Personnalisé (je coche moi-même)",
+        "name": "Home Assistant", "tenant": False,
+        "steps": ["general", "updates", "users"],
     },
 }
 
 STEP_LABELS = {
     "general": "Réglages généraux (nom, France, €, fuseau, unités)",
     "updates": "Mises à jour (Supervisor, Core, OS)",
-    "users": "Comptes (famille, Claude, compte de service HA-MCP)",
+    "users": "Comptes des personnes (saisis à l'écran)",
     "hacs": "Boutique : Marketplace intégrée (ou HACS si HA < 2026.11)",
-    "ha_mcp": "HA-MCP (accès de Claude)",
-    "acces_distant": "Accès distant (intégration Basilik41, mode réglages)",
-    "remote_ha": "Remote Home Assistant (liaisons entre instances)",
-    "cloudflare": "Cloudflare (tunnel, DNS, certificat mTLS, règles WAF)",
+    "ha_mcp": "HA-MCP : laisser Claude (claude.ai) lire et régler cette instance",
+    "acces_distant": "Accès distant (intégration privée Basilik41, jeton GitHub requis)",
+    "remote_ha": "Remote Home Assistant (voir les entités d'autres instances)",
+    "cloudflare": "Accès depuis l'extérieur par Cloudflare (tunnel, DNS, protection)",
 }
 STEP_ORDER = ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "remote_ha", "cloudflare"]
 
@@ -1125,9 +1126,9 @@ class Bootstrap:
         if status is not None and not status.get("user"):
             self.ui.info("owner_intro", "Instance neuve",
                          "Aucun compte n'existe encore : on crée ton compte administrateur.\n\n"
-                         "Mets le MÊME identifiant de connexion que sur la Grange : le bouton « Aller à… » "
-                         "te reconnaîtra alors tout seul.")
-            name = self.ui.ask("owner_name", "Ton compte", "Nom affiché :", default="Richard")
+                         "Si tu as déjà d'autres instances Home Assistant, mets le MÊME identifiant "
+                         "de connexion : elles te reconnaîtront.")
+            name = self.ui.ask("owner_name", "Ton compte", "Ton prénom (nom affiché) :")
             username = self.ui.ask("owner_username", "Ton compte", "Identifiant de connexion :",
                                    default=self.conf.get("owner_username", ""), validate=self.check_username)
             pwd = self.new_password("owner")
@@ -1191,7 +1192,8 @@ class Bootstrap:
     # ═════════════ 3. choix ═════════════
     def choose_plan(self):
         items = [(k, v["label"]) for k, v in PROFILES.items()]
-        self.profile = self.ui.menu("profile", "Type d'instance", "Quel rôle pour cette instance ?", items, "centrale")
+        self.profile = self.ui.menu("profile", "Type d'instance", "Quel rôle pour cette instance ?", items,
+                                    self.conf.get("last_profile", "principal"))
         prof = PROFILES[self.profile]
         cfg = self.ha.config()
         current = cfg.get("location_name") or ""
@@ -1199,12 +1201,17 @@ class Bootstrap:
         self.instance_name = self.ui.ask("instance_name", "Nom", "Nom de l'instance (affiché dans l'app) :",
                                          default=default_name)
         self.instance_slug = slugify(self.instance_name)
-        items = [(s, STEP_LABELS[s], s in prof["steps"]) for s in STEP_ORDER]
+        remembered = self.conf.get(f"steps.{self.profile}")
+        chosen = remembered if isinstance(remembered, list) else prof["steps"]
+        items = [(s, STEP_LABELS[s], s in chosen) for s in STEP_ORDER]
         self.steps = self.ui.checklist("steps", "Ce qui sera fait",
                                        "Espace pour cocher / décocher, Entrée pour valider.\n"
                                        "Tout est relançable : une étape déjà faite est simplement vérifiée.", items)
         if not self.steps:
             raise Abort("Rien de coché.")
+        self.conf["last_profile"] = self.profile
+        self.conf[f"steps.{self.profile}"] = self.steps
+        self.save_conf()
 
     # ═════════════ étapes ═════════════
     def step_general(self):
@@ -1295,38 +1302,77 @@ class Bootstrap:
         raise HAError("timeout", "le Supervisor ne répond plus")
 
     # -- comptes --
+    def ask_person(self, tenant: bool, taken: set) -> dict:
+        role = "locataire" if tenant else "personne"
+        name = self.ui.ask("people.name", "Nouveau compte", f"Prénom ou nom affiché de la {role} :")
+        hint = ("Identifiant UNIQUE (ex. dupont-appart2) : jamais « locataire » ou « invite »,\n"
+                "sinon deux logements reliés à la même centrale confondraient les comptes."
+                if tenant else
+                "Identifiant de connexion. Si cette personne a déjà un compte sur une autre de tes\n"
+                "instances Home Assistant, mets le MÊME (les instances se reconnaissent par lui).")
+
+        def check(v):
+            err = self.check_username(v)
+            if err:
+                return err
+            if v in taken:
+                return "Cet identifiant est déjà pris."
+            if tenant and v in ("locataire", "invite", "guest", "user", "tenant"):
+                return "Trop générique : ajoute le nom et le logement."
+            return None
+        base = slugify(name)[:20] + (f"-{self.instance_slug}" if tenant else "")
+        username = self.ui.ask("people.username", f"Compte de {name}", hint, default=base[:32], validate=check)
+        admin = False if tenant else self.ui.yesno(
+            "people.admin", f"Compte de {name}", f"{name} peut-il tout régler (administrateur) ?\n\n"
+            "Non = il utilise les tableaux de bord sans pouvoir casser la configuration.", default=False)
+        remote = self.ui.yesno("people.remote", f"Compte de {name}",
+                               f"{name} peut-il se connecter depuis l'extérieur (4G, ailleurs) ?\n\n"
+                               "Non = seulement sur le Wi-Fi de la maison.", default=True)
+        return {"name": name, "username": username, "admin": admin, "local_only": not remote, "person": True}
+
     def step_users(self):
         users = self.ha.call("config/auth/list")
         by_name = {(u.get("username") or "").casefold(): u for u in users if u.get("username")}
         persons = self.ha.call("person/list")
         person_users = {p.get("user_id") for p in (persons.get("storage") or []) + (persons.get("config") or [])}
-        wanted = []
-        for p in PROFILES[self.profile]["people"]:
-            if p.get("tenant"):
-                name = self.ui.ask("tenant_name", "Locataire", "Nom du locataire (affiché) :", default="Locataire")
-                username = self.ui.ask("tenant_username", "Locataire",
-                                       "Identifiant UNIQUE du locataire (ex. dupont-bien1).\n"
-                                       "Jamais « locataire » ou « invite » : deux biens reliés le confondraient.",
-                                       default=f"{slugify(name)}-{self.instance_slug}"[:32],
-                                       validate=lambda v: self.check_username(v) or (
-                                           "Trop générique : ajoute le nom et le bien." if v in ("locataire", "invite", "guest", "user") else None))
-                wanted.append({"name": name, "username": username, "admin": False, "person": True})
-            else:
-                username = self.ui.ask(f"user.{p['name']}", f"Compte de {p['name']}",
-                                       f"Identifiant de connexion de {p['name']}\n(le MÊME que sur ses autres instances) :",
-                                       default=self.conf.get(f"username.{p['name']}", p["username"]),
-                                       validate=self.check_username)
-                self.conf[f"username.{p['name']}"] = username
-                wanted.append({"name": p["name"], "username": username, "admin": p["admin"], "person": True})
-        if self.profile == "perso":
-            while self.ui.yesno("perso.add", "Comptes", "Ajouter un compte de personne ?", default=False):
-                name = self.ui.ask("perso.name", "Compte", "Nom affiché :")
-                username = self.ui.ask("perso.username", "Compte", "Identifiant :", default=slugify(name),
-                                       validate=self.check_username)
-                admin = self.ui.yesno("perso.admin", "Compte", f"{name} administrateur ?", default=False)
-                wanted.append({"name": name, "username": username, "admin": admin, "person": True})
+        tenant = PROFILES[self.profile]["tenant"]
+        wanted: list[dict] = []
+        present = [u for u in users if u.get("username") and not u.get("system_generated")]
+        current = ", ".join(f"{u['name']} ({u['username']})" for u in present) or "aucun"
+        last = [] if tenant else [p for p in self.conf.get("people", []) if p.get("username", "").casefold() not in by_name]
+        if last:
+            liste = "\n".join(f"  • {p['name']} ({p['username']}{', admin' if p.get('admin') else ''})" for p in last)
+            if self.ui.yesno("people.reuse", "Mêmes personnes ?",
+                             f"Comptes déjà présents : {current}\n\n"
+                             f"Lors d'une instance précédente, tu as créé :\n{liste}\n\n"
+                             "Créer les mêmes comptes ici (mêmes identifiants) ?", default=True):
+                wanted += [dict(p, person=True) for p in last]
+        taken = set(by_name) | {w["username"] for w in wanted}
+        first = True
+        while self.ui.yesno("people.add", "Comptes",
+                            f"Comptes déjà présents : {current}"
+                            + (f"\nÀ créer : {', '.join(w['username'] for w in wanted)}" if wanted else "")
+                            + ("\n\nAjouter le compte du locataire ?" if tenant and first else "\n\nAjouter une personne ?"),
+                            default=first and not wanted and (tenant or len(present) <= 1)):
+            p = self.ask_person(tenant, taken)
+            wanted.append(p)
+            taken.add(p["username"])
+            first = False
+        if not tenant:
+            known = {p["username"]: p for p in self.conf.get("people", [])}
+            for w in wanted:
+                known[w["username"]] = {k: w[k] for k in ("name", "username", "admin", "local_only") if k in w}
+            self.conf["people"] = list(known.values())
         if "ha_mcp" in self.steps:
-            wanted.append({"name": "Claude", "username": "claude", "admin": True, "person": False, "show": True})
+            claude_user = self.conf.get("claude_username", "claude")
+            if claude_user.casefold() not in by_name:
+                claude_user = self.ui.ask("claude_username", "Compte pour claude.ai",
+                                          "Identifiant du compte que claude.ai utilisera pour se connecter\n"
+                                          "(tu le saisiras en ajoutant le connecteur) :",
+                                          default=claude_user, validate=lambda v: self.check_username(v) or (
+                                              "Déjà pris." if v in taken else None))
+            self.conf["claude_username"] = claude_user
+            wanted.append({"name": "Claude", "username": claude_user, "admin": True, "person": False, "show": True})
             wanted.append({"name": "HA-MCP Server", "username": "ha-mcp", "admin": True, "local_only": True,
                            "person": False, "show": False, "service": True})
         self.save_conf()
@@ -1517,7 +1563,7 @@ class Bootstrap:
             code, url = ph.get("code", "?"), ph.get("url", "https://github.com/login/device")
             print(f"\n   \033[1;33mCode GitHub : {code}\033[0m   ({url})\n", flush=True)
             self.ui.info("github_code", f"Relier {who} à GitHub (1 min)",
-                         f"1. Ouvre {url}\n   (connecté avec ton compte GitHub Basilik41)\n"
+                         f"1. Ouvre {url}\n   (connecté avec ton compte GitHub)\n"
                          f"2. Saisis le code :   {code}\n3. Clique « Authorize ».\n\n"
                          "Puis valide ici : le script vérifie tout seul.")
             deadline = time.time() + 900
@@ -1620,7 +1666,7 @@ class Bootstrap:
                 token = self.ui.ask("github_token", "Jeton GitHub",
                                     f"Le dépôt {ACCES_DISTANT_REPO} est privé.\n\n"
                                     "Colle le jeton GitHub « fine-grained » en lecture seule sur ce dépôt\n"
-                                    "(le même que dans secrets.yaml de la Grange : github_acces_distant).\n\n"
+                                    "(fourni par l'auteur de l'intégration).\n\n"
                                     "GitHub → Settings → Developer settings → Fine-grained tokens.",
                                     secret=True)
             s, p = http("GET", f"{GITHUB_API}/repos/{ACCES_DISTANT_REPO}/commits/main",
@@ -1788,7 +1834,7 @@ class Bootstrap:
         entry = entries[0]
         extra = ""
         if not any(e["entry_id"] != entry["entry_id"] for e in self.ha.entries("ha_mcp_tools")):
-            # entrée « File & YAML Tools » : lecture des fichiers et du YAML par Claude (comme sur la Maison)
+            # entrée « File & YAML Tools » : lecture des fichiers et du YAML par Claude
             r = self.ha.flow_start("ha_mcp_tools")
             fid = r.get("flow_id")
             try:
@@ -1856,7 +1902,7 @@ class Bootstrap:
                 self.ha.flow_abort(fid)
             raise
         self.next_steps.append("Accès distant : code des réglages, Wi-Fi et sites reliés → je m'en occupe par le MCP.")
-        return "mode « réglages » (certificats gérés depuis la Grange)"
+        return "mode « réglages » (certificats gérés par l'instance principale)"
 
     # -- Cloudflare --
     def step_cloudflare(self):
@@ -1876,6 +1922,13 @@ class Bootstrap:
         self.save_conf()
         self.public_host = host
         tname = host
+        self.cf_mode = self.ui.menu(
+            "cf_mode", "Protection de l'accès extérieur", f"Comment protéger {host} ?",
+            [("mtls", "Certificat obligatoire sur chaque appareil (recommandé)"),
+             ("login", "Mot de passe Home Assistant seulement (plus simple, moins sûr)")],
+            self.conf.get(f"cf_mode.{self.instance_slug}", "mtls"))
+        self.conf[f"cf_mode.{self.instance_slug}"] = self.cf_mode
+        self.save_conf()
         self.preflight(cf, zid, acc, host)
         if self.webhook_path is None:
             self.webhook_path = self.conf.get(f"webhook.{self.instance_slug}")
@@ -1891,7 +1944,8 @@ class Bootstrap:
                 raise StepSkipped(f"{host} déjà utilisé : choisis un autre sous-domaine")
         steps = []
         # 1. protections AVANT d'ouvrir l'accès
-        steps.append(self.cf_mtls(cf, zid, host))
+        if self.cf_mode == "mtls":
+            steps.append(self.cf_mtls(cf, zid, host))
         steps.append(self.cf_waf(cf, zid, host))
         # 2. tunnel
         tunnels = cf.req("GET", f"/accounts/{acc}/cfd_tunnel", params={"name": tname, "is_deleted": "false"}) or []
@@ -1934,6 +1988,13 @@ class Bootstrap:
         # 6. contrôle : sans certificat, Cloudflare doit refuser
         verdict = self.public_check(host)
         steps.append(verdict)
+        if self.cf_mode == "mtls":
+            if "acces_distant" in self.steps:
+                self.next_steps.append("Certificats des appareils : avec l'intégration Accès distant de l'instance principale.")
+            else:
+                made = self.device_certs(cf, zid, host)
+                if made:
+                    steps.append(f"{made} certificat(s) d'appareil")
         return ", ".join(s for s in steps if s)
 
     @staticmethod
@@ -2011,6 +2072,18 @@ class Bootstrap:
             e = self.WEBHOOK_COND.sub('starts_with(http.request.uri.path, "/api/webhook/")', e)
         return e
 
+    def _gen_block(self, host: str) -> str:
+        e = (f'(http.host eq "{host}")\n'
+             "and not (cf.tls_client_auth.cert_verified and not cf.tls_client_auth.cert_revoked)\n"
+             'and not (http.request.uri.path eq "/auth/token")')
+        if "ha_mcp" in self.steps:
+            w = (f'http.request.uri.path eq "{self.webhook_path}"' if self.webhook_path
+                 else 'starts_with(http.request.uri.path, "/api/webhook/")')
+            e += (f"\nand not (ip.src in {{{ANTHROPIC_RANGE}}}\n         and ({w}\n"
+                  '              or starts_with(http.request.uri.path, "/.well-known/")\n'
+                  '              or starts_with(http.request.uri.path, "/api/ha_mcp_tools/oauth/")))')
+        return e
+
     def cf_waf(self, cf: Cloudflare, zid: str, host: str) -> str:
         try:
             rs = cf.req("GET", f"/zones/{zid}/rulesets/phases/http_request_firewall_custom/entrypoint")
@@ -2020,36 +2093,42 @@ class Bootstrap:
             else:
                 raise
         rules = (rs or {}).get("rules") or []
+        mine = lambda r: "— ha-bootstrap" in (r.get("description") or "")  # noqa: E731
         tblock = next((r for r in rules if r.get("action") == "block" and "cf.tls_client_auth" in r.get("expression", "")
                        and self._host_of(r.get("expression", "")) and self._host_of(r["expression"]) != host
-                       and "— ha-bootstrap" not in (r.get("description") or "")), None)
+                       and not mine(r)), None)
         tskip = next((r for r in rules if r.get("action") == "skip" and ANTHROPIC_RANGE in r.get("expression", "")
                       and self._host_of(r.get("expression", "")) and self._host_of(r["expression"]) != host
-                      and "— ha-bootstrap" not in (r.get("description") or "")), None)
-        if not tblock:
-            self.next_steps.append(f"WAF : aucune règle modèle « certificat obligatoire » trouvée. Copie la règle "
-                                   f"de la carte Accès distant (Grange) en remplaçant l'hôte par {host}.")
-            raise HAError("waf", "aucune règle mTLS existante à reprendre (règle « Ha- externe »)")
+                      and not mine(r)), None)
         backup_dir = os.path.join(CONF_DIR, "backups")
         os.makedirs(backup_dir, mode=0o700, exist_ok=True)
         bpath = os.path.join(backup_dir, f"waf-{zid[:8]}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
-        save_json(bpath, rs, private=True)
+        save_json(bpath, rs or {"rules": []}, private=True)
 
         plan = []
-        nblock = {"action": "block", "expression": self._clone_expr(tblock["expression"], host),
-                  "description": f"{(tblock.get('description') or 'Certificat obligatoire')} {host} — ha-bootstrap",
-                  "enabled": True}
-        plan.append(("block", tblock, nblock))
-        if tskip:
-            nskip = {"action": "skip", "expression": self._clone_expr(tskip["expression"], host),
-                     "description": f"{(tskip.get('description') or 'Claude')} {host} — ha-bootstrap",
-                     "enabled": True, "action_parameters": tskip.get("action_parameters") or {"ruleset": "current"}}
-            if tskip.get("logging"):
-                nskip["logging"] = tskip["logging"]
+        skip_params = {"ruleset": "current", "phases": ["http_request_sbfm"]}
+        if self.cf_mode == "mtls":
+            if tblock:   # on reprend tes règles existantes (même logique, autre hôte)
+                expr = self._clone_expr(tblock["expression"], host)
+                desc = f"{(tblock.get('description') or 'Certificat obligatoire')} {host} — ha-bootstrap"
+            else:        # aucune règle existante : règle complète générée
+                expr = self._gen_block(host)
+                desc = f"Certificat obligatoire {host} — ha-bootstrap"
+            plan.append(("block", tblock, {"action": "block", "expression": expr, "description": desc, "enabled": True}))
+        if "ha_mcp" in self.steps:
+            if tskip:
+                nskip = {"action": "skip", "expression": self._clone_expr(tskip["expression"], host),
+                         "description": f"{(tskip.get('description') or 'Claude')} {host} — ha-bootstrap",
+                         "enabled": True, "action_parameters": tskip.get("action_parameters") or skip_params}
+                if tskip.get("logging"):
+                    nskip["logging"] = tskip["logging"]
+            else:
+                nskip = {"action": "skip", "expression": f'(http.host eq "{host}" and ip.src in {{{ANTHROPIC_RANGE}}})',
+                         "description": f"Claude {host} — ha-bootstrap", "enabled": True,
+                         "action_parameters": skip_params, "logging": {"enabled": True}}
             plan.append(("skip", tskip, nskip))
-        else:
-            self.next_steps.append("WAF : pas de règle « HA-MCP - Claude » à reprendre ; Claude risque d'être bloqué "
-                                   "par la protection anti-robots.")
+        if not plan:
+            return "aucune règle nécessaire"
 
         existing = {r.get("description"): r for r in rules}
         todo = []
@@ -2061,31 +2140,100 @@ class Bootstrap:
             todo.append((kind, tpl, new, cur))
         if not todo:
             return "règles WAF déjà en place"
+        what = ("copiées de tes règles existantes (qui ne changent pas)" if tblock or tskip
+                else "créées pour cette instance (tes autres règles ne changent pas)")
         preview = "\n\n".join(f"« {n['description']} » ({'nouvelle' if not c else 'mise à jour'}, action {n['action']}) :\n"
                               f"{n['expression']}" for _, _, n, c in todo)
         if not self.ui.yesno("waf_confirm", "Règles WAF",
-                             f"Ajout de règles pour {host}, copiées de tes règles existantes "
-                             f"(qui ne changent pas) :\n\n{preview}\n\nSauvegarde : {bpath}\n\nAppliquer ?"):
-            self.next_steps.append(f"WAF non appliqué : {host} est ouvert SANS certificat obligatoire tant que la règle manque.")
+                             f"Règles pour {host}, {what} :\n\n{preview}\n\nSauvegarde : {bpath}\n\nAppliquer ?"):
+            if self.cf_mode == "mtls":
+                raise HAError("waf", "sans ces règles, le certificat ne serait pas exigé : tunnel non ouvert")
             raise StepSkipped("règles WAF refusées")
+        if rs is None:  # aucune règle personnalisée dans la zone : on crée la liste
+            path = f"/zones/{zid}/rulesets/phases/http_request_firewall_custom/entrypoint"
+            try:
+                cf.req("PUT", path, {"rules": [n for _, _, n, _ in todo]})
+            except CFError as e:
+                if not any(n["action"] == "skip" for _, _, n, _ in todo) or "limit" in e.text:
+                    raise
+                for _, _, n, _ in todo:  # offre sans « Super Bot Fight Mode »
+                    if n["action"] == "skip":
+                        n["action_parameters"] = {"ruleset": "current"}
+                cf.req("PUT", path, {"rules": [n for _, _, n, _ in todo]})
+            self.ui.ok(f"Règles WAF en place pour {host}")
+            return f"règles WAF ({len(todo)}) créées"
         rsid = rs["id"]
-        after_id = tblock["id"]
+        after_id = tblock["id"] if tblock else None
         for kind, tpl, new, cur in todo:
+            pos = {"after": after_id} if after_id else {"index": 1}
             try:
                 if cur:
                     res = cf.req("PATCH", f"/zones/{zid}/rulesets/{rsid}/rules/{cur['id']}", new)
                 else:
-                    res = cf.req("POST", f"/zones/{zid}/rulesets/{rsid}/rules", dict(new, position={"after": after_id}))
+                    try:
+                        res = cf.req("POST", f"/zones/{zid}/rulesets/{rsid}/rules", dict(new, position=pos))
+                    except CFError as e:
+                        if kind != "skip" or "limit" in e.text or "maximum" in e.text:
+                            raise
+                        # offre sans « Super Bot Fight Mode » : on saute seulement les règles personnalisées
+                        new["action_parameters"] = {"ruleset": "current"}
+                        res = cf.req("POST", f"/zones/{zid}/rulesets/{rsid}/rules", dict(new, position=pos))
             except CFError as e:
                 if any(w in e.text for w in ("limit", "maximum", "quota", "exceed")):
                     raise HAError("waf", "Cloudflare refuse une règle de plus (limite de ton offre). "
-                                  "Libère une règle ou ajoute l'hôte à la main dans « Ha- externe ».")
+                                  "Libère une règle dans Cloudflare (Sécurité → WAF), puis Réessayer.")
                 raise
             mine = next((r for r in (res or {}).get("rules") or [] if r.get("description") == new["description"]), None)
             if mine:
                 after_id = mine["id"]
         self.ui.ok(f"Règles WAF en place pour {host}")
         return f"règles WAF ({len(todo)}) ajoutées"
+
+    def device_certs(self, cf: Cloudflare, zid: str, host: str) -> int:
+        if not shutil.which("openssl"):
+            self.next_steps.append("Certificats : openssl absent ; crée-les dans Cloudflare → SSL/TLS → Certificats clients.")
+            return 0
+        d = os.path.join(CONF_DIR, "certificats", host)
+        made = 0
+        while self.ui.yesno("cert.add", "Certificats des appareils",
+                            "Chaque téléphone, tablette ou PC qui ouvrira Home Assistant depuis l'extérieur "
+                            "a besoin de son certificat.\n\nCréer un certificat pour un appareil ?",
+                            default=made == 0):
+            name = self.ui.ask("cert.name", "Certificat", "Nom de l'appareil (ex. telephone-paul) :",
+                               validate=lambda v: None if re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,40}$", v)
+                               else "Lettres, chiffres, point, tiret ; sans espace.")
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            key, csr, crt, p12 = (os.path.join(d, f"{name}.{x}") for x in ("key", "csr", "crt", "p12"))
+            pwd = gen_password(12)
+            env = dict(os.environ, HAB_P12=pwd)
+            try:
+                subprocess.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+                                "-out", csr, "-subj", f"/CN={name}"], check=True, capture_output=True, timeout=60)
+                os.chmod(key, 0o600)
+                res = cf.req("POST", f"/zones/{zid}/client_certificates",
+                             {"csr": open(csr).read(), "validity_days": 3650})
+                with open(crt, "w") as f:
+                    f.write(res["certificate"])
+                subprocess.run(["openssl", "pkcs12", "-export", "-inkey", key, "-in", crt, "-name", name,
+                                "-out", p12, "-passout", "env:HAB_P12", "-keypbe", "PBE-SHA1-3DES",
+                                "-certpbe", "PBE-SHA1-3DES", "-macalg", "sha1"],
+                               check=True, capture_output=True, timeout=60, env=env)
+                os.chmod(p12, 0o600)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                err = getattr(e, "stderr", b"") or b""
+                raise HAError("certificat", f"openssl : {err.decode(errors='replace')[-300:]}")
+            finally:
+                for f in (key, csr):
+                    if os.path.exists(f):
+                        os.remove(f)
+            made += 1
+            self.secrets_out.append((f"Certificat {name} ({p12})", pwd))
+        if made:
+            self.next_steps.append(
+                f"Certificats : fichiers .p12 dans {d}. Copie chacun sur son appareil (câble, WinSCP…), puis :\n"
+                "   Android : Paramètres → Sécurité → Chiffrement → Installer un certificat → « Certificat utilisateur » ;\n"
+                "   PC : double-clic sur le .p12. Le mot de passe est affiché à l'écran suivant. Efface ensuite le fichier.")
+        return made
 
     def public_check(self, host: str) -> str:
         url = PUBLIC_CHECK.format(host=host)
@@ -2096,10 +2244,15 @@ class Bootstrap:
                 time.sleep(10)
                 continue
             if s == 403:
+                if self.cf_mode == "login":
+                    self.next_steps.append(f"{host} refuse l'accès : une autre règle Cloudflare bloque (pays ?).")
+                    return "⚠ accès refusé par Cloudflare"
                 return "vérifié : refusé sans certificat ✔"
-            if s == 200:
-                self.next_steps.append(f"ATTENTION : {host} répond SANS certificat. Vérifie la règle WAF.")
-                return "⚠ accessible sans certificat"
+            if s in (200, 401):
+                if self.cf_mode == "mtls":
+                    self.next_steps.append(f"ATTENTION : {host} répond SANS certificat. Vérifie la règle WAF.")
+                    return "⚠ accessible sans certificat"
+                return "vérifié : joignable (mot de passe Home Assistant)"
             time.sleep(10)
         self.next_steps.append(f"Vérifie depuis ton téléphone (4G, avec certificat) que https://{host} s'ouvre.")
         return "contrôle public impossible d'ici (DNS pas encore propagé)"
@@ -2115,9 +2268,11 @@ class Bootstrap:
             self.next_steps.insert(0, "Ajouter Claude : claude.ai → Paramètres → Connecteurs → Ajouter un connecteur "
                                    f"personnalisé\n   Nom : HA {self.instance_name}\n"
                                    f"   URL : https://{self.public_host}{self.webhook_path}\n"
-                                   "   Connexion avec le compte « claude » (depuis un appareil qui a ton certificat).")
+                                   f"   Connexion avec le compte « {self.conf.get('claude_username', 'claude')} »"
+                                   + (" (depuis un appareil qui a son certificat)." if getattr(self, "cf_mode", "") == "mtls" else "."))
         self.next_steps.append("Active la double authentification sur ton compte (Profil → Sécurité).")
-        self.next_steps.append("Dis à Claude « c'est branché » : liaisons, tableaux de bord et réglages fins.")
+        if "ha_mcp" in self.steps:
+            self.next_steps.append("Dis à Claude « c'est branché » : il peut alors lire et régler cette instance.")
         text = "\n".join(lines) + "\n\nÀ faire maintenant :\n" + "\n".join(f"• {s}" for s in self.next_steps)
         for line in text.split("\n"):
             print("  " + line)
@@ -2131,7 +2286,7 @@ class Bootstrap:
         if self.secrets_out:
             sec = "\n".join(f"{who} :\n   {pwd}" for who, pwd in self.secrets_out)
             self.ui.info("secrets", "Mots de passe provisoires (affichés une seule fois)",
-                         sec + "\n\nNote-les dans Vaultwarden MAINTENANT.\nIls ne sont écrits nulle part.")
+                         sec + "\n\nNote-les dans ton gestionnaire de mots de passe MAINTENANT.\nIls ne sont écrits nulle part.")
         self.snapshot("socle", "socle prêt", "snapshot_after", default=True)
         self.close_session()
 
