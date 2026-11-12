@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -1017,6 +1017,7 @@ class Bootstrap:
         self.webhook_path: str | None = None
         self.public_host: str | None = None
         self.next_steps: list[str] = []
+        self.revealed: list[tuple[str, str]] = []
 
     # -- sauvegardes locales --
     def save_conf(self):
@@ -1031,6 +1032,23 @@ class Bootstrap:
                          "Sinon il te sera redemandé à chaque lancement.", default=True):
             self.vault[key] = value
             save_json(os.path.join(CONF_DIR, "secrets.json"), self.vault, private=True)
+
+    def reveal(self, items: list[tuple[str, str]], key: str):
+        """Affiche des mots de passe AUSSITÔT créés, en grand, et attend « noté »."""
+        if not items:
+            return
+        block = "\n".join(f"  {who}\n      ➜  {pwd}" for who, pwd in items)
+        bar = "═" * 64
+        print(f"\n\033[1;33m{bar}\n  ⚠  MOTS DE PASSE À NOTER MAINTENANT (enregistrés nulle part)\n{bar}\033[0m\n"
+              f"{block}\n\033[1;33m{bar}\033[0m\n", flush=True)
+        self.revealed += [i for i in items if i not in self.revealed]
+        while True:
+            v = self.ui.ask(f"{key}.noted", "⚠ MOTS DE PASSE À NOTER MAINTENANT",
+                            f"{block}\n\nIls ne sont enregistrés nulle part : note-les tout de suite\n"
+                            "(gestionnaire de mots de passe), puis tape  noté  et Valider.",
+                            default="noté" if self.ui.scripted else "", allow_empty=True)
+            if v.strip().lower().rstrip(".!") in ("noté", "note", "noter", "c'est noté"):
+                return
 
     # -- exécution d'une étape avec reprise --
     def run_step(self, sid: str, title: str, fn) -> bool:
@@ -1533,6 +1551,23 @@ class Bootstrap:
                              f"Lors d'une instance précédente, tu as créé :\n{liste}\n\n"
                              "Créer les mêmes comptes ici (mêmes identifiants) ?", default=True):
                 wanted += [dict(p, person=True) for p in last]
+        renewable = [u for u in present if not u.get("is_owner") and u["username"] != "ha-mcp"]
+        while renewable and self.ui.yesno("people.renew", "Mot de passe perdu ?",
+                                          f"Comptes déjà présents : {current}\n\n"
+                                          "Donner un nouveau mot de passe à l'un d'eux (mot de passe perdu ou jamais vu) ?",
+                                          default=False):
+            if not self.me.get("is_owner"):
+                self.ui.error_box("people.renew", "Impossible", "Seul le compte propriétaire peut changer le mot de passe "
+                                  "d'un autre compte : relance le script avec ton compte.")
+                break
+            who = self.ui.menu("people.renew.who", "Quel compte ?", "Nouveau mot de passe pour :",
+                               [(u["username"], f"{u['name']} ({u['username']})") for u in renewable])
+            u = next(x for x in renewable if x["username"] == who)
+            pwd = gen_password()
+            self.ha.call("config/auth_provider/homeassistant/admin_change_password", user_id=u["id"], password=pwd)
+            item = (f"{u['name']} — identifiant : {u['username']} (nouveau)", pwd)
+            self.secrets_out.append(item)
+            self.reveal([item], "secret")
         taken = set(by_name) | {w["username"] for w in wanted}
         first = True
         while self.ui.yesno("people.add", "Comptes",
@@ -1584,7 +1619,9 @@ class Bootstrap:
                 if w.get("service"):
                     self.service_password = pwd
                 elif w.get("show", True):
-                    self.secrets_out.append((f"{w['name']} (identifiant {w['username']})", pwd))
+                    item = (f"{w['name']} — identifiant : {w['username']}", pwd)
+                    self.secrets_out.append(item)
+                    self.reveal([item], "secret")
             if w.get("person") and user_id not in person_users:
                 self.ha.call("person/create", name=w["name"], user_id=user_id)
         if made:
@@ -2519,7 +2556,9 @@ class Bootstrap:
                     if os.path.exists(f):
                         os.remove(f)
             made += 1
-            self.secrets_out.append((f"Certificat {name} ({p12})", pwd))
+            item = (f"Certificat {name} ({p12})", pwd)
+            self.secrets_out.append(item)
+            self.reveal([item], "secret")
         if made:
             self.next_steps.append(
                 f"Certificats : fichiers .p12 dans {d}. Copie chacun sur son appareil (câble, WinSCP…), puis :\n"
@@ -2577,8 +2616,8 @@ class Bootstrap:
         self.ui.info("summary", f"Terminé — {self.instance_name}", text + f"\n\nRapport : {rpath}")
         if self.secrets_out:
             sec = "\n".join(f"{who} :\n   {pwd}" for who, pwd in self.secrets_out)
-            self.ui.info("secrets", "Mots de passe provisoires (affichés une seule fois)",
-                         sec + "\n\nNote-les dans ton gestionnaire de mots de passe MAINTENANT.\nIls ne sont écrits nulle part.")
+            self.ui.info("secrets", "Rappel des mots de passe créés",
+                         sec + "\n\nDernier affichage : ils ne sont enregistrés nulle part.")
         self.snapshot("socle", "socle prêt", "snapshot_after", default=True)
         self.close_session()
 
@@ -2629,6 +2668,10 @@ def main():
         boot = Bootstrap()
         boot.run()
     except Abort as e:
+        if boot and boot.secrets_out:
+            pend = [i for i in boot.secrets_out if i not in boot.revealed]
+            if pend:
+                print("\n  MOTS DE PASSE CRÉÉS AVANT L'ARRÊT (à noter) :\n" + "\n".join(f"  {w} ➜ {p}" for w, p in pend))
         print(f"\n  ■ {e}\n  Relance le script quand tu veux : il reprendra là où il s'est arrêté.")
         if LOG.path:
             print(f"  Journal : {LOG.path}")

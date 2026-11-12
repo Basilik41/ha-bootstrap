@@ -269,7 +269,9 @@ def scenario_fresh():
                     leaks.append(f"{d}/{f}: {secret[:6]}")
     check("[neuve] aucun secret dans journaux et rapports", not leaks, str(leaks))
     check("[neuve] mots de passe de julie et claude affichés à la fin (pas celui du compte de service)",
-          out.count("(identifiant julie)") >= 1 and "(identifiant claude)" in out and "(identifiant ha-mcp)" not in out)
+          "identifiant : julie" in out and "identifiant : claude" in out and "identifiant : ha-mcp" not in out)
+    check("[neuve] mots de passe affichés DÈS la création, avant la suite (pas seulement au bilan)",
+          0 <= out.find("MOTS DE PASSE À NOTER MAINTENANT") < out.find("▶ Boutique") and out.find("identifiant : julie") < out.find("▶ Boutique"))
     qm = open(os.path.join(WORK, "qm.log")).read()
     check("[neuve] instantanés Proxmox avant et après", "snapshot 105 hab_avant_" in qm and "snapshot 105 hab_socle_" in qm, qm)
     jobs = json.load(open(os.path.join(WORK, "pvesh.json")))
@@ -446,6 +448,15 @@ def scenario_failures():
     users = {u["username"]: u for u in ha.call("config/auth/list") if u.get("username")}
     check("[reprise] Paul repris de l'instance précédente, administrateur", "paul" in users
           and "system-admin" in users["paul"]["group_ids"] and "créés : paul" in out, out[-600:])
+    # mot de passe perdu : renouvellement guidé
+    answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "principal",
+               "instance_name": "Centrale", "steps": ["users"], "people.renew": [True, False],
+               "people.renew.who": "claude", "people.add": False, "summary": "ok", "secrets": "ok", "snapshot_after": False}
+    out = run_script("renouvelle", answers)
+    import re as _re2
+    m = _re2.search(r"identifiant : claude \(nouveau\)\n\s+➜\s+(\S+)", out)
+    h2 = hb.HA(HA_URL, hb.UI.__new__(hb.UI))
+    check("[renouvelle] nouveau mot de passe de claude affiché et valable", m and h2.login("claude", m.group(1)) is None, out[-500:])
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "location",
                "instance_name": "Centrale", "steps": ["users"], "people.add": [True, False], "people.name": "Martin",
                "people.username": ["locataire", "martin-appart"], "people.remote": True,
