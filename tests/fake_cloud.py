@@ -105,6 +105,9 @@ class H(BaseHTTPRequestHandler):
     def do_PATCH(self):
         self.route("PATCH")
 
+    def do_DELETE(self):
+        self.route("DELETE")
+
     def route(self, method):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
@@ -268,6 +271,9 @@ class H(BaseHTTPRequestHandler):
                 r = next(r for r in rules if r["id"] == m.group(1))
                 r.update(b)
                 return self.ok(rs)
+            if method == "DELETE":
+                rs["rules"] = [r for r in rules if r["id"] != m.group(1)]
+                return self.ok(rs)
         self.err(404, 7003, f"route simulée inconnue : {method} {path}")
 
     def _bad_skip(self, rules):
@@ -289,8 +295,13 @@ class H(BaseHTTPRequestHandler):
     # ── accès public simulé : refuse sans certificat si l'hôte est protégé ──
     def public(self, rest):
         host = rest.split("/", 1)[0]
+        def has_host(e):
+            if f'http.host eq "{host}"' in e:
+                return True
+            m = re.search(r'http\.host in \{([^}]*)\}', e)
+            return bool(m and f'"{host}"' in m.group(1))
         protected = host in STATE["mtls"] and any(
-            r["action"] == "block" and f'http.host eq "{host}"' in r["expression"]
+            r["action"] == "block" and has_host(r["expression"])
             and "cf.tls_client_auth.cert_verified" in r["expression"] for r in (STATE["ruleset"] or {"rules": []})["rules"])
         exists = any(r["name"] == host for r in STATE["dns"])
         if not exists:

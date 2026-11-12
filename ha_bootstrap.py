@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -2350,6 +2350,8 @@ class Bootstrap:
         if not plan:
             return "aucune règle nécessaire"
 
+        if tblock and self.conf.get(f"waf_merge.{zid}"):
+            return self.cf_waf_merge(cf, zid, host, bpath)
         existing = {r.get("description"): r for r in rules}
         todo = []
         for kind, tpl, new in plan:
@@ -2400,14 +2402,84 @@ class Bootstrap:
                         res = cf.req("POST", f"/zones/{zid}/rulesets/{rsid}/rules", dict(new, position=pos))
             except CFError as e:
                 if any(w in e.text for w in ("limit", "maximum", "quota", "exceed")):
+                    if tblock and self.ui.menu(
+                            "waf_limit", "Limite de règles atteinte",
+                            "Ton offre Cloudflare refuse une règle de plus (5 règles personnalisées en offre gratuite).\n\n"
+                            f"Solution : ajouter {host} dans tes règles existantes « {tblock.get('description')} »"
+                            + (f" et « {tskip.get('description')} »" if tskip else "") + ", sans règle de plus.",
+                            [("merge", "Ajouter l'hôte dans mes règles existantes (recommandé)"),
+                             ("stop", "Ne rien faire (je libère une règle moi-même)")], "merge") == "merge":
+                        return self.cf_waf_merge(cf, zid, host, bpath)
                     raise HAError("waf", "Cloudflare refuse une règle de plus (limite de ton offre). "
-                                  "Libère une règle dans Cloudflare (Sécurité → WAF), puis Réessayer.")
+                                  "Libère une règle dans Cloudflare (Sécurité → Règles de sécurité), puis Réessayer.")
                 raise
             mine = next((r for r in (res or {}).get("rules") or [] if r.get("description") == new["description"]), None)
             if mine:
                 after_id = mine["id"]
         self.ui.ok(f"Règles WAF en place pour {host}")
         return f"règles WAF ({len(todo)}) ajoutées"
+
+    @staticmethod
+    def _merge_set(expr: str, field_re: str, field: str, value: str, prefix: str | None = None) -> str:
+        """Ajoute `value` à la condition `field eq "x"` ou `field in {...}` (la première qui convient)."""
+        for m in re.finditer(field_re + r'\s+(eq\s+"([^"]+)"|in\s+\{([^}]*)\})', expr):
+            items = [m.group(2)] if m.group(2) else re.findall(r'"([^"]+)"', m.group(3) or "")
+            if prefix and not all(i.startswith(prefix) for i in items):
+                continue
+            if value in items:
+                return expr
+            joined = " ".join(f'"{i}"' for i in items + [value])
+            return expr[:m.start()] + f"{field} in {{{joined}}}" + expr[m.end():]
+        return expr
+
+    def _merge_expr(self, expr: str, host: str) -> str:
+        e = self._merge_set(expr, r"http\.host", "http.host", host)
+        if self.webhook_path:
+            e = self._merge_set(e, r"http\.request\.uri\.path", "http.request.uri.path", self.webhook_path,
+                                prefix="/api/webhook/")
+        else:  # chemin inconnu : tous les webhooks, toujours limités aux adresses d'Anthropic
+            e = self.WEBHOOK_COND.sub('starts_with(http.request.uri.path, "/api/webhook/")', e)
+        return e
+
+    def cf_waf_merge(self, cf: Cloudflare, zid: str, host: str, bpath: str) -> str:
+        """Pas de règle de plus : l'hôte est ajouté dans les règles existantes, nos ajouts partiels sont retirés."""
+        rs = cf.req("GET", f"/zones/{zid}/rulesets/phases/http_request_firewall_custom/entrypoint")
+        rules = rs.get("rules") or []
+        mine = lambda r: "— ha-bootstrap" in (r.get("description") or "")  # noqa: E731
+        partial = [r for r in rules if mine(r) and (r.get("description") or "").endswith(f"{host} — ha-bootstrap")]
+        tblock = next((r for r in rules if r.get("action") == "block" and "cf.tls_client_auth" in r.get("expression", "")
+                       and not mine(r)), None)
+        tskip = next((r for r in rules if r.get("action") == "skip" and ANTHROPIC_RANGE in r.get("expression", "")
+                      and not mine(r)), None)
+        changes = []
+        if self.cf_mode == "mtls" and tblock:
+            changes.append((tblock, self._merge_expr(tblock["expression"], host)))
+        if "ha_mcp" in self.steps and tskip:
+            changes.append((tskip, self._merge_expr(tskip["expression"], host)))
+        changes = [(r, e) for r, e in changes if e != r["expression"]]
+        if not changes and not partial:
+            return f"{host} déjà présent dans tes règles"
+        preview = "\n\n".join(f"« {r.get('description')} » devient :\n{e}" for r, e in changes)
+        if partial:
+            preview += "\n\nRetirée (ajoutée tout à l'heure par ha-bootstrap, devenue inutile) :\n" + \
+                "\n".join(f"  « {r.get('description')} »" for r in partial)
+        if not self.ui.yesno("waf_merge_confirm", "Ajout dans tes règles",
+                             f"{preview}\n\nSauvegarde : {bpath}\n\nAppliquer ?"):
+            raise HAError("waf", "modification refusée : tunnel non ouvert")
+        rsid = rs["id"]
+        for r, e in changes:  # d'abord étendre (la protection existe à chaque instant)
+            body = {k: r[k] for k in ("action", "description", "enabled", "action_parameters", "logging") if k in r}
+            body["expression"] = e
+            cf.req("PATCH", f"/zones/{zid}/rulesets/{rsid}/rules/{r['id']}", body)
+        for r in partial:  # puis retirer nos règles en double
+            cf.req("DELETE", f"/zones/{zid}/rulesets/{rsid}/rules/{r['id']}")
+        self.conf[f"waf_merge.{zid}"] = True
+        self.save_conf()
+        names = " et ".join(f"« {r.get('description')} »" for r, _ in changes) or "tes règles"
+        self.next_steps.append(f"Règles Cloudflare : {host} est maintenant dans {names}. Si tu remplaces un jour ces "
+                               "règles à la main (ex. depuis une carte Accès distant), relance ha-bootstrap : il remettra l'hôte.")
+        self.ui.ok(f"{host} ajouté dans tes règles existantes")
+        return f"{host} ajouté dans {len(changes)} règle(s) existante(s)" + (f", {len(partial)} doublon retiré" if partial else "")
 
     def device_certs(self, cf: Cloudflare, zid: str, host: str) -> int:
         if not shutil.which("openssl"):

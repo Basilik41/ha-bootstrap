@@ -344,14 +344,39 @@ def scenario_failures():
     check("[échec] étape passée avec explication", "déjà utilisé" in out)
     check("[échec] pas de tunnel créé pour l'hôte refusé", len(s["tunnels"]) == 1)
 
-    # c) limite de règles de l'offre atteinte → message clair, rien de cassé
-    cloud("/test/set", {"rule_limit": len(s["ruleset"]["rules"])})
+    # c) limite de règles (offre gratuite) : la 1re règle passe, la 2e est refusée → l'hôte est ajouté
+    #    dans les règles existantes, la règle ajoutée en trop est retirée, le tunnel s'ouvre protégé
+    s = cloud()
+    base_rules = s["ruleset"]["rules"]
+    cloud("/test/set", {"rule_limit": len(base_rules) + 1})
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "perso",
-               "instance_name": "Troisieme", "steps": ["cloudflare"], "host_label": "ha-troisieme",
-               "waf_confirm": True, "error.cloudflare": "skip", "summary": "ok", "snapshot_after": False}
+               "instance_name": "Troisieme", "steps": ["ha_mcp", "cloudflare"], "host_label": "ha-troisieme",
+               "waf_confirm": True, "waf_merge_confirm": True, "cert.add": False, "summary": "ok", "snapshot_after": False}
     out = run_script("limite", answers)
-    check("[échec] limite de règles expliquée", "limite de ton offre" in out, out[-1200:])
-    check("[échec] pas de tunnel ouvert sans règle", len(cloud()["tunnels"]) == 1)
+    s = cloud()
+    rules = s["ruleset"]["rules"]
+    tb = next(r for r in rules if r["id"] == "r1")
+    tk = next(r for r in rules if r["id"] == "r2")
+    wp = json.load(open(os.path.join(CONF, "config.json"))).get("webhook.troisieme")
+    check("[limite] aucune règle de plus (doublon retiré)", len(rules) == len(base_rules), str([r["description"] for r in rules]))
+    check("[limite] hôte ajouté dans « Ha- externe » avec son webhook, l'ancien conservé",
+          'http.host in {"ha.degest.test" "ha-troisieme.degest.test"}' in tb["expression"]
+          and "grangeWEBHOOK" in tb["expression"] and wp and wp in tb["expression"], tb["expression"])
+    check("[limite] hôte ajouté dans « HA-MCP - Claude », action inchangée",
+          '"ha-troisieme.degest.test"' in tk["expression"] and tk["action_parameters"] == {"ruleset": "current", "phases": ["http_request_sbfm"]})
+    check("[limite] tunnel ouvert et protégé", "refusé sans certificat" in out and any(
+        t["public"]["name"] == "ha-troisieme.degest.test" for t in s["tunnels"].values()), out[-800:])
+    check("[limite] avertissement : relancer si la règle est remplacée à la main", "relance ha-bootstrap" in out)
+    # deuxième hôte dans la même zone : directement ajouté aux règles existantes, sans essayer d'en créer
+    answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "perso",
+               "instance_name": "Quatre", "steps": ["cloudflare"], "host_label": "ha-quatre",
+               "waf_merge_confirm": True, "cert.add": False, "summary": "ok", "snapshot_after": False}
+    out = run_script("limite2", answers)
+    s = cloud()
+    tb = next(r for r in s["ruleset"]["rules"] if r["id"] == "r1")
+    check("[limite] hôte suivant ajouté directement, sans tentative de règle",
+          '"ha-quatre.degest.test"' in tb["expression"] and len(s["ruleset"]["rules"]) == len(base_rules)
+          and "waf_confirm" not in out, tb["expression"][:200])
     cloud("/test/set", {"rule_limit": 10})
 
     # d) chez un ami : zone sans aucune règle, offre sans Super Bot Fight, certificats créés par le script

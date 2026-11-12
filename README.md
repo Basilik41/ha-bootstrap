@@ -60,7 +60,9 @@ Le script **ne modifie jamais les règles existantes**. Les règles qu'il ajoute
 - **Offre sans Super Bot Fight Mode** : la règle Claude saute seulement les règles personnalisées.
 
 Une sauvegarde complète des règles est écrite avant toute modification dans `~/.config/ha-bootstrap/backups/`.
-Si l'offre Cloudflare refuse une règle de plus, le script l'explique et **n'ouvre pas le tunnel**.
+Si l'offre Cloudflare refuse une règle de plus (5 règles personnalisées en offre gratuite), le script propose
+d'**ajouter le nouvel hôte dans les règles existantes** (`http.host in {…}`), sans règle de plus, et retire
+ce qu'il aurait ajouté en trop. Il s'en souvient ensuite pour cette zone. S'il ne peut pas protéger l'hôte, il **n'ouvre pas le tunnel**.
 Le tunnel n'est jamais ouvert avant que la protection soit en place.
 
 ## Ce qui reste manuel (guidé à l'écran)

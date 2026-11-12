@@ -60,6 +60,16 @@ def run():
     t("variante sans exception /auth/token conservée telle quelle",
       'http.request.uri.path eq "/auth/token" or' in out and 'and not (http.request.uri.path eq "/auth/token")' not in out)
 
+    b.webhook_path = "/api/webhook/NOUVEAU987654"
+    m = b._merge_expr(src, "ha-c.exemple.fr")
+    t("fusion : hôte ajouté à l'ensemble", 'http.host in {"ha.exemple.fr" "ha-c.exemple.fr"}' in m)
+    t("fusion : webhook ajouté à côté de l'ancien",
+      'http.request.uri.path in {"/api/webhook/ANCIEN123456" "/api/webhook/NOUVEAU987654"}' in m)
+    t("fusion : /auth/token intact", 'and not (http.request.uri.path eq "/auth/token")' in m)
+    t("fusion idempotente", b._merge_expr(m, "ha-c.exemple.fr") == m)
+    m2 = b._merge_expr(m, "ha-d.exemple.fr")
+    t("fusion d'un 3e hôte", 'http.host in {"ha.exemple.fr" "ha-c.exemple.fr" "ha-d.exemple.fr"}' in m2)
+
     t("identifiants valides", all(hb.Bootstrap.check_username(u) is None for u in ("richard", "julie", "dupont-bien1", "a.b_c")))
     t("identifiants refusés", all(hb.Bootstrap.check_username(u) for u in ("Richard", "a", "jean dupont", "-x", "é")))
     t("hôtes", all(hb.HOST_RE.match(h) for h in ("ha-centrale.degestmultiservices.cc", "a.b.fr"))
