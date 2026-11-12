@@ -21,6 +21,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 WORK = "/tmp/hab_e2e"
 CFG = os.path.join(WORK, "ha")
+CFG2 = os.path.join(WORK, "ha_grange")
+PAYLOAD = os.path.join(WORK, "payload")
+RHA_SRC = "/home/claude/src/rha/custom_components/remote_homeassistant"
 CONF = os.path.join(WORK, "conf")
 CLOUD_PORT = 18080
 CLOUD = f"http://127.0.0.1:{CLOUD_PORT}"
@@ -54,18 +57,19 @@ ENV_BASE = dict(os.environ, NO_PROXY=f"127.0.0.1,localhost,{IP}", no_proxy=f"127
 
 
 class HARunner:
-    def __init__(self, hass_bin):
+    def __init__(self, hass_bin, cfg=None):
         self.hass_bin = hass_bin
+        self.cfg = cfg or CFG
         self.proc = None
         self.stop = False
         self.t = threading.Thread(target=self.loop, daemon=True)
 
     def loop(self):
-        env = dict(ENV_BASE, HAB_TEST_PAYLOAD=os.path.join(HERE, "fake_ha", "payload"), HAB_TEST_CLOUD=CLOUD,
+        env = dict(ENV_BASE, HAB_TEST_PAYLOAD=PAYLOAD, HAB_TEST_CLOUD=CLOUD,
                    HAB_TEST_TMP=os.path.join(WORK, "addon_tmp"), HAB_TEST_RATE_LIMIT="1")
-        log = open(os.path.join(WORK, "hass.out"), "a")
+        log = open(os.path.join(WORK, "hass.out" if self.cfg == CFG else "hass2.out"), "a")
         while not self.stop:
-            self.proc = subprocess.Popen([self.hass_bin, "-c", CFG, "--ignore-os-check"], env=env,
+            self.proc = subprocess.Popen([self.hass_bin, "-c", self.cfg, "--ignore-os-check"], env=env,
                                          stdout=log, stderr=subprocess.STDOUT)
             rc = self.proc.wait()
             log.write(f"\n### hass exit {rc}\n")
@@ -86,7 +90,7 @@ class HARunner:
                 self.proc.kill()
 
 
-def run_script(name, answers, extra_env=None, expect_rc=0):
+def run_script(name, answers, extra_env=None, expect_rc=0, args=()):
     path = os.path.join(WORK, f"answers_{name}.json")
     json.dump(answers, open(path, "w"))
     env = dict(ENV_BASE, HAB_ANSWERS=path, HAB_CONF_DIR=CONF, HAB_CF_API=CLOUD + "/client/v4",
@@ -97,7 +101,7 @@ def run_script(name, answers, extra_env=None, expect_rc=0):
                PATH=os.path.join(HERE, "bin") + ":" + os.environ["PATH"])
     env.update(extra_env or {})
     t0 = time.time()
-    r = subprocess.run([os.environ.get("HAB_PY", sys.executable), "-I", os.path.join(ROOT, "ha_bootstrap.py")], env=env,
+    r = subprocess.run([os.environ.get("HAB_PY", sys.executable), "-I", os.path.join(ROOT, "ha_bootstrap.py"), *args], env=env,
                        capture_output=True, text=True, timeout=1800)
     out = r.stdout + r.stderr
     open(os.path.join(WORK, f"out_{name}.txt"), "w").write(out)
@@ -127,10 +131,20 @@ def main():
     open(os.path.join(CFG, "configuration.yaml"), "w").write(
         "api:\nconfig:\nonboarding:\nperson:\nwebhook:\nwebsocket_api:\nhab_fake_supervisor:\n"
         "logger:\n  default: warning\n")
+    shutil.copytree(os.path.join(HERE, "fake_ha", "payload"), PAYLOAD)
+    shutil.rmtree(os.path.join(PAYLOAD, "remote_homeassistant"))
+    shutil.copytree(RHA_SRC, os.path.join(PAYLOAD, "remote_homeassistant"))  # la vraie intégration
+    os.makedirs(os.path.join(CFG2, "custom_components"))
+    shutil.copytree(RHA_SRC, os.path.join(CFG2, "custom_components", "remote_homeassistant"))
+    open(os.path.join(CFG2, "configuration.yaml"), "w").write(
+        "http:\n  server_port: 8124\napi:\nconfig:\nonboarding:\nperson:\nwebsocket_api:\nsun:\n"
+        "input_boolean:\n  alarme_grange:\n    name: Alarme Grange\nlogger:\n  default: warning\n")
     cloud_p = subprocess.Popen([sys.executable, os.path.join(HERE, "fake_cloud.py"), str(CLOUD_PORT), ad_repo],
                                env=ENV_BASE, stdout=open(os.path.join(WORK, "cloud.out"), "w"), stderr=subprocess.STDOUT)
     runner = HARunner(hass_bin)
     runner.start()
+    runner2 = HARunner(hass_bin, CFG2)
+    runner2.start()
     try:
         for _ in range(240):
             try:
@@ -140,9 +154,11 @@ def main():
                 time.sleep(1)
         scenario_fresh()
         scenario_rerun()
+        scenario_liaisons()
         scenario_failures()
     finally:
         runner.shutdown()
+        runner2.shutdown()
         cloud_p.terminate()
     bad = [r for r in RESULTS if not r[1]]
     print(f"\n════ {len(RESULTS) - len(bad)}/{len(RESULTS)} vérifications OK ════")
@@ -314,6 +330,73 @@ def scenario_rerun():
     ha = ha_session()
     check("[relance] pas de doublon de personne", len(ha.call("person/list")["storage"]) == 2)
     ha.ws_close()
+
+
+# ───────────────────────── scénario 2b : liaison vers une 2e instance (vraie Remote HA des deux côtés) ─────────
+
+R_URL = "http://127.0.0.1:8124"  # adresse « locale » pour HA (le réseau du banc, 192.0.2.x, ne l est pas)
+
+
+def grange_setup():
+    for _ in range(240):
+        try:
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(R_URL + "/api/onboarding", timeout=3)
+            break
+        except Exception:
+            time.sleep(1)
+    g = hb.HA(R_URL, hb.UI.__new__(hb.UI))
+    g.create_owner("Richard", "richard", PWD)
+    for step in ("core_config", "analytics"):
+        g.req("POST", f"/api/onboarding/{step}", json_body={})
+    g.req("POST", "/api/onboarding/integration", json_body={"client_id": g.client_id, "redirect_uri": g.redirect})
+    g.call("config/core/update", location_name="Grange")
+    f = g.flow_start("remote_homeassistant")
+    g.flow_step(f["flow_id"], {"type": "Setup as remote node"})
+    return g
+
+
+def scenario_liaisons():
+    g = grange_setup()
+    answers = {"target": "105", "snapshot_before": False, "login_password": PWD,
+               "liaison.add": [True, False], "liaison.url": R_URL, "liaison.username": "richard",
+               "liaison.password": PWD, "liaison.local_only": True, "summary": "ok", "snapshot_after": False}
+    out = run_script("liaisons", answers, args=["--liaisons"])
+    users = {u["username"]: u for u in g.call("config/auth/list") if u.get("username")}
+    lu = users.get("liaison-centrale")
+    check("[liaisons] compte dédié liaison-centrale sur la Grange : non admin, réseau local seulement",
+          lu and lu["group_ids"] == ["system-users"] and lu["local_only"] is True, json.dumps(lu))
+    entries = json.load(open(os.path.join(CFG, ".storage", "core.config_entries")))["data"]["entries"]
+    rha = [e for e in entries if e["domain"] == "remote_homeassistant"]
+    titles = [e["title"] for e in ha_session().entries("remote_homeassistant")]
+    check("[liaisons] liaison « Grange » créée ici (titre sans « (YAML) »)", titles == ["Grange"], str(titles))
+    opts = rha[0]["options"] if rha else {}
+    check("[liaisons] filtre restrictif posé dès la création, préfixe grange_",
+          opts.get("include_entities") == ["sun.hab_liste_blanche_a_definir"] and opts.get("entity_prefix") == "grange_",
+          json.dumps(opts))
+    ha = ha_session()
+    time.sleep(5)
+    states = [s["entity_id"] for s in ha.req("GET", "/api/states")[1]]
+    imported = [e for e in states if "grange_" in e and "remote" not in e]
+    check("[liaisons] aucune entité de la Grange importée tant que la liste blanche n'est pas choisie", not imported, str(imported))
+    conf_yaml = open(os.path.join(CFG, "configuration.yaml")).read()
+    check("[liaisons] import temporaire retiré (configuration.yaml propre, fichier du jeton effacé)",
+          "hab_liaisons" not in conf_yaml and not os.path.exists(os.path.join(CFG, "hab_liaisons.yaml")))
+    tok = rha[0]["data"].get("access_token") if rha else ""
+    leaks = [f for f in os.listdir(os.path.join(CONF, "logs")) if tok and tok in open(os.path.join(CONF, "logs", f)).read()]
+    check("[liaisons] jeton absent des journaux", tok and not leaks)
+    check("[liaisons] la liaison fonctionne (jeton valable sur la Grange)",
+          hb.http("GET", R_URL + "/api/", headers={"Authorization": f"Bearer {tok}"}, local=True)[0] == 200)
+    check("[liaisons] mode « seulement les liaisons » : aucune autre étape", "▶ Comptes" not in out and "▶ Cloudflare" not in out)
+    # relance : rien de recréé
+    out = run_script("liaisons2", dict(answers, **{"liaison.known": [], "liaison.add": [True, False]}), args=["--liaisons"])
+    entries = json.load(open(os.path.join(CFG, ".storage", "core.config_entries")))["data"]["entries"]
+    users2 = [u for u in g.call("config/auth/list") if (u.get("username") or "").startswith("liaison-")]
+    check("[liaisons] relance : « déjà reliée », ni doublon de liaison ni de compte",
+          "Grange (déjà reliée)" in out and len([e for e in entries if e["domain"] == "remote_homeassistant"]) == 1
+          and len(users2) == 1, out[-600:])
+    # ajouter une liaison « reprise » : le compte existe déjà → mot de passe renouvelé, pas de doublon (propriétaire)
+    ha.ws_close()
+    g.ws_close()
 
 
 # ───────────────────────── scénario 3 : cas d'échec ─────────────────────────

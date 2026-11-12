@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -68,7 +68,7 @@ PROFILES = {
     "centrale": {
         "label": "Centrale (regarde plusieurs autres instances)",
         "name": "Centrale", "tenant": False,
-        "steps": ["general", "updates", "users", "hacs", "remote_ha", "cloudflare"],
+        "steps": ["general", "updates", "users", "hacs", "remote_ha", "liaisons", "cloudflare"],
     },
     "perso": {
         "label": "Personnalisé (je coche moi-même)",
@@ -85,9 +85,11 @@ STEP_LABELS = {
     "ha_mcp": "HA-MCP : laisser Claude (claude.ai) lire et régler cette instance",
     "acces_distant": "Accès distant (intégration privée Basilik41, jeton GitHub requis)",
     "remote_ha": "Remote Home Assistant (voir les entités d'autres instances)",
+    "liaisons": "Relier à mes autres instances (un compte dédié par liaison)",
     "cloudflare": "Accès depuis l'extérieur par Cloudflare (tunnel, DNS, protection)",
 }
-STEP_ORDER = ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "remote_ha", "cloudflare"]
+STEP_ORDER = ["general", "updates", "users", "hacs", "ha_mcp", "acces_distant", "remote_ha", "liaisons", "cloudflare"]
+NOTHING_ENTITY = "sun.hab_liste_blanche_a_definir"  # filtre initial : aucune entité importée
 
 
 # ───────────────────────────── erreurs ─────────────────────────────
@@ -994,6 +996,46 @@ finally:
 '''
 
 
+# Pose / retire l'import YAML temporaire des liaisons Remote Home Assistant (dans l'app File editor).
+LIAISON_YAML = r'''
+import json, os, re, sys
+root = "/homeassistant" if os.path.isdir("/homeassistant") else "/config"
+P = os.path.join(root, ".hab_params.json")
+with open(P) as f:
+    prm = json.load(f)
+os.remove(P)
+conf = os.path.join(root, "configuration.yaml")
+inc = os.path.join(root, "hab_liaisons.yaml")
+LINE = "remote_homeassistant: !include hab_liaisons.yaml  # ha-bootstrap : import temporaire"
+def out(**kw):
+    print(json.dumps(kw)); sys.exit(0)
+text = open(conf).read() if os.path.exists(conf) else ""
+lines = text.splitlines()
+if prm["action"] == "add":
+    if any(re.match(r"^remote_homeassistant\s*:", l) and l.strip() != LINE for l in lines):
+        out(ok=False, error="configuration.yaml contient déjà « remote_homeassistant: » : liaisons à faire à la main")
+    with open(inc, "w") as f:
+        f.write(prm["yaml"])
+    os.chmod(inc, 0o600)
+    if LINE not in lines:
+        with open(conf, "a") as f:
+            f.write(("" if text.endswith("\n") or not text else "\n") + LINE + "\n")
+    out(ok=True)
+else:
+    kept = [l for l in lines if l.strip() != LINE]
+    if kept != lines:
+        with open(conf, "w") as f:
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+    if os.path.exists(inc):
+        os.remove(inc)
+    out(ok=True)
+'''
+
+
+def yaml_str(v: str) -> str:
+    return json.dumps(v, ensure_ascii=False)  # une chaîne JSON est une chaîne YAML valide
+
+
 # ───────────────────────────── le script ─────────────────────────────
 
 class Bootstrap:
@@ -1365,6 +1407,23 @@ class Bootstrap:
         self.finish_onboarding(status)
         cfg = self.ha.config()
         self.ui.ok(f"Connecté en tant que {me.get('name')} — Home Assistant {cfg.get('version')}")
+        self.uuid = self.instance_uuid(self.ha)
+
+    @staticmethod
+    def instance_uuid(ha: "HA") -> str | None:
+        try:
+            s, p = ha.req("GET", "/api/remote_homeassistant/discovery", timeout=10)
+            if s == 200 and isinstance(p, dict):
+                return p.get("uuid")
+        except (NetError, HAError):
+            pass
+        return None
+
+    def remember_instance(self):
+        insts = [i for i in self.conf.get("instances", []) if i.get("base") != self.ha.base]
+        insts.append({"name": self.instance_name, "slug": self.instance_slug, "base": self.ha.base})
+        self.conf["instances"] = insts
+        self.save_conf()
 
     def new_password(self, key: str) -> str:
         while True:
@@ -1395,6 +1454,17 @@ class Bootstrap:
 
     # ═════════════ 3. choix ═════════════
     def choose_plan(self):
+        mode = "liaisons" if "--liaisons" in sys.argv[1:] else self.ui.menu(
+            "mode", "Que faire ?", "Que veux-tu faire sur cette instance ?",
+            [("all", "Préparer ou vérifier toute l'instance"),
+             ("liaisons", "Seulement la relier à mes autres instances")], "all")
+        if mode == "liaisons":
+            cfg = self.ha.config()
+            self.instance_name = cfg.get("location_name") or "Home Assistant"
+            self.instance_slug = slugify(self.instance_name)
+            self.steps = ["hacs", "remote_ha", "liaisons"]
+            self.remember_instance()
+            return
         items = [(k, v["label"]) for k, v in PROFILES.items()]
         self.profile = self.ui.menu("profile", "Type d'instance", "Quel rôle pour cette instance ?", items,
                                     self.conf.get("last_profile", "principal"))
@@ -1413,9 +1483,12 @@ class Bootstrap:
                                        "Tout est relançable : une étape déjà faite est simplement vérifiée.", items)
         if not self.steps:
             raise Abort("Rien de coché.")
+        if "liaisons" in self.steps and "remote_ha" not in self.steps:
+            self.steps.append("remote_ha")  # une liaison a besoin de Remote Home Assistant ici
         self.conf["last_profile"] = self.profile
         self.conf[f"steps.{self.profile}"] = self.steps
         self.save_conf()
+        self.remember_instance()
 
     # ═════════════ étapes ═════════════
     def step_general(self):
@@ -2105,6 +2178,209 @@ class Bootstrap:
             if r.get("flow_id"):
                 self.ha.flow_abort(r["flow_id"], options=True)
 
+    # -- liaisons vers d'autres instances --
+    def step_liaisons(self):
+        if not self.ha.has_integration("remote_homeassistant"):
+            raise StepSkipped("Remote Home Assistant n'est pas installé ici (étape Boutique ?)")
+        links = self.conf.setdefault("links", {}).setdefault(self.instance_slug, {})
+        local_entries = self.ha.entries("remote_homeassistant")
+        titles = {e.get("title", "").removesuffix(" (YAML)") for e in local_entries}
+        targets = []
+        known = [i for i in self.conf.get("instances", []) if i.get("base") != self.ha.base]
+        if known:
+            items = [(i["base"], f"{i['name']} ({i['base']})" + (" — déjà reliée" if i["name"] in titles else ""),
+                      i["name"] not in titles) for i in known]
+            targets += self.ui.checklist("liaison.known", "Relier à…",
+                                         f"Instances que {self.instance_name} doit voir :", items)
+        while self.ui.yesno("liaison.add", "Relier à une autre instance",
+                            ("Instances choisies : " + ", ".join(targets) + "\n\n" if targets else "")
+                            + f"Ajouter une instance que {self.instance_name} doit voir, par son adresse locale ?",
+                            default=not targets):
+            url = self.ui.ask("liaison.url", "Adresse de l'autre instance",
+                              "Adresse locale, telle qu'on l'ouvre dans le navigateur\n"
+                              "(ex. http://10.20.20.126:8123, ou http://10.10.1.108 si elle est sur le port 80) :",
+                              default="http://",
+                              validate=lambda v: None if re.match(r"^https?://[^/\s]+$", v) else "Forme attendue : http://10.20.20.126:8123")
+            targets.append(url.rstrip("/"))
+        if not targets:
+            return "aucune nouvelle liaison"
+        local_only = self.ui.yesno("liaison.local_only", "Comptes de liaison",
+                                   "Les comptes de liaison ne serviront que sur ton réseau local ?\n\n"
+                                   "Oui (recommandé) : même avec son jeton, personne ne peut s'en servir depuis Internet.\n"
+                                   "Non : seulement si les instances se joignent par Internet.", default=True)
+        instances, done = [], []
+        for base in targets:
+            res = self.link_prepare(base, local_only, titles)
+            if res is None:
+                continue
+            if res.get("already"):
+                done.append(f"{res['name']} (déjà reliée)")
+                continue
+            instances.append(res)
+        if not instances:
+            return ", ".join(done) or "aucune nouvelle liaison"
+        made = self.link_import(instances)
+        for inst in instances:
+            links[inst["uuid"] or inst["name"]] = {"name": inst["name"], "base": inst["base"], "account": inst["account"],
+                                                    "prefix": inst["entity_prefix"]}
+        self.save_conf()
+        self.next_steps.append(
+            "Liaisons créées SANS rien importer (filtre restrictif). Choisis ce que cette instance doit voir : "
+            "Paramètres → Intégrations → Remote Home-Assistant → Configurer, ou demande-le à Claude.")
+        self.next_steps.append("Couper une liaison : supprime le compte " + ", ".join(
+            sorted({f"« {i['account']} » sur {i['name']}" for i in instances})) + " (Paramètres → Personnes → Utilisateurs).")
+        return ", ".join(made + done)
+
+    def link_prepare(self, base: str, local_only: bool, titles: set) -> dict | None:
+        """Sur l'autre instance : compte dédié + jeton longue durée. Renvoie la ligne d'import."""
+        u = urllib.parse.urlparse(base)
+        if not u.port and u.scheme == "http":
+            found = self.probe_base(u.hostname)
+            base = found or base
+            u = urllib.parse.urlparse(base)
+        r = HA(base, self.ui)
+        try:
+            s, txt, _ = http("GET", base + "/auth/providers", local=True, timeout=8, raw=True)
+        except NetError as e:
+            raise HAError("liaison", f"{base} injoignable depuis ce serveur : {e}")
+        if s != 200 or "homeassistant" not in txt:
+            raise HAError("liaison", f"{base} n'est pas un Home Assistant (HTTP {s})")
+        user = self.ui.ask("liaison.username", f"Connexion à {base}",
+                           f"Identifiant d'un administrateur de {base}\n(il sert une seule fois, à créer le compte de liaison) :",
+                           default=self.conf.get("owner_username", ""))
+        for attempt in range(3):
+            pwd = self.ui.ask("liaison.password", f"Connexion à {base}", f"Mot de passe de {user} sur {base} :", secret=True)
+            res = r.login(user, pwd, mfa_code=lambda: self.ui.ask("liaison.mfa", "Double authentification",
+                                                                   f"Code à 6 chiffres pour {base} :"))
+            if res is None:
+                break
+            self.ui.error_box("liaison.password", "Connexion refusée", f"{base} refuse la connexion ({res}).")
+        else:
+            raise HAError("liaison", f"connexion impossible à {base}")
+        try:
+            me = r.call("auth/current_user")
+            if not me.get("is_admin"):
+                raise HAError("liaison", f"{user} n'est pas administrateur de {base}")
+            name = r.config().get("location_name") or base
+            if name in titles:
+                return {"name": name, "already": True}
+            uuid = self.instance_uuid(r)
+            if not uuid:
+                uuid = self.link_enable_remote(r, base, name)
+            if uuid and uuid == getattr(self, "uuid", None):
+                raise HAError("liaison", f"{base} est cette instance elle-même")
+            account = f"liaison-{self.instance_slug}"[:32].rstrip("-")
+            users = r.call("config/auth/list")
+            existing = next((x for x in users if (x.get("username") or "").casefold() == account), None)
+            lpwd = gen_password(24)
+            if existing:
+                if not me.get("is_owner"):
+                    raise HAError("liaison", f"le compte {account} existe déjà sur {name} : seul son propriétaire peut le "
+                                  "renouveler (connecte-toi avec le compte propriétaire)")
+                r.call("config/auth_provider/homeassistant/admin_change_password", user_id=existing["id"], password=lpwd)
+            else:
+                created = r.call("config/auth/create", name=f"Liaison {self.instance_name}",
+                                 group_ids=["system-users"], local_only=local_only)
+                try:
+                    r.call("config/auth_provider/homeassistant/create", user_id=created["user"]["id"],
+                           username=account, password=lpwd)
+                except HAError:
+                    r.call("config/auth/delete", user_id=created["user"]["id"])
+                    raise
+            t = HA(base, self.ui)
+            res = t.login(account, lpwd)
+            if res is not None:
+                raise HAError("liaison", f"le compte {account} ne peut pas se connecter à {name} ({res})")
+            token = t.call("auth/long_lived_access_token", client_name=f"Remote HA ({self.instance_name})", lifespan=3650)
+            LOG.hide(token)
+            try:
+                for tk in t.call("auth/refresh_tokens") or []:
+                    if tk.get("is_current"):
+                        t.call("auth/delete_refresh_token", refresh_token_id=tk["id"])
+            except HAError:
+                pass
+            t.ws_close()
+            self.ui.ok(f"{name} : compte « {account} » ({'réseau local seulement' if local_only else 'accès Internet permis'}) et jeton créés")
+            prefix = slugify(name).replace("-", "_") + "_"
+            return {"name": name, "base": base, "uuid": uuid, "account": account, "host": u.hostname,
+                    "port": u.port or (443 if u.scheme == "https" else 80), "secure": u.scheme == "https",
+                    "token": token, "entity_prefix": prefix}
+        finally:
+            r.ws_close()
+
+    def link_enable_remote(self, r: "HA", base: str, name: str) -> str | None:
+        """L'autre instance n'expose pas encore Remote HA : l'installer et l'activer (avec accord)."""
+        if not self.ui.yesno("liaison.install_remote", f"Préparer {name}",
+                             f"{name} n'a pas Remote Home Assistant, nécessaire pour être lue.\n\n"
+                             f"L'installer sur {name} et l'activer en « nœud distant » ?\n"
+                             f"{name} redémarrera une fois (une minute environ).", default=True):
+            raise StepSkipped(f"{name} non préparée")
+        saved, saved_kind = self.ha, getattr(self, "_store_kind", None)
+        try:
+            self.ha = r
+            if hasattr(self, "_store_kind"):
+                del self._store_kind
+            if not r.has_integration("remote_homeassistant"):
+                self.marketplace_ready() if self.store_kind() == "marketplace" else self.legacy_hacs()
+                self.store_install([REMOTE_HA_REPO])
+                r.restart(f"Remote Home Assistant sur {name}")
+        finally:
+            self.ha = saved
+            if saved_kind:
+                self._store_kind = saved_kind
+            elif hasattr(self, "_store_kind"):
+                del self._store_kind
+        if not any(e.get("title") == "Remote instance" for e in r.entries("remote_homeassistant")):
+            f = r.flow_start("remote_homeassistant")
+            res = r.flow_step(f["flow_id"], {"type": "Setup as remote node"})
+            if not res or res.get("type") not in ("create_entry", "abort"):
+                raise HAError("liaison", f"activation de Remote HA sur {name} refusée : {res}")
+        for _ in range(20):
+            uuid = self.instance_uuid(r)
+            if uuid:
+                return uuid
+            time.sleep(3)
+        raise HAError("liaison", f"{name} ne publie pas son identifiant Remote HA")
+
+    def link_import(self, instances: list[dict]) -> list[str]:
+        """Crée les liaisons ici par un import YAML ponctuel : le filtre existe avant la 1re connexion."""
+        lines = ["instances:"]
+        for i in instances:
+            lines += [f"  - host: {yaml_str(i['host'])}", f"    port: {i['port']}",
+                      f"    secure: {'true' if i['secure'] else 'false'}", "    verify_ssl: false",
+                      f"    access_token: {yaml_str(i['token'])}", f"    entity_prefix: {yaml_str(i['entity_prefix'])}",
+                      f"    service_prefix: {yaml_str(i['entity_prefix'])}",
+                      "    include:", f"      entities: [{NOTHING_ENTITY}]"]
+        text = "\n".join(lines) + "\n"
+        before = {e["entry_id"] for e in self.ha.entries("remote_homeassistant")}
+        out = self.file_editor_python(LIAISON_YAML, {"action": "add", "yaml": text})
+        if not out.get("ok"):
+            raise HAError("liaison", out.get("error", "écriture refusée"))
+        try:
+            s, chk = self.ha.req("POST", "/api/config/core/check_config", timeout=120)
+            if s != 200 or (isinstance(chk, dict) and chk.get("result") != "valid"):
+                raise HAError("liaison", f"configuration refusée : {chk}")
+            self.ha.restart("création des liaisons")
+            new = []
+            for _ in range(30):
+                new = [e for e in self.ha.entries("remote_homeassistant") if e["entry_id"] not in before]
+                if len(new) >= len(instances):
+                    break
+                time.sleep(3)
+        finally:
+            self.file_editor_python(LIAISON_YAML, {"action": "remove"})  # jeton retiré des fichiers
+        made = []
+        for e in new:
+            title = e.get("title", "").removesuffix(" (YAML)")
+            if title != e.get("title"):
+                self.ha.call("config_entries/update", entry_id=e["entry_id"], title=title)
+            made.append(f"{title} reliée ({e.get('state')})")
+        missing = len(instances) - len(new)
+        if missing:
+            raise HAError("liaison", f"{missing} liaison(s) non créée(s) : regarde le journal de Home Assistant")
+        self.ui.ok("Liaisons créées, rien importé tant que la liste blanche n'est pas choisie")
+        return made
+
     # -- Accès distant --
     def step_acces_distant(self):
         if not self.ha.has_integration("acces_distant"):
@@ -2640,7 +2916,8 @@ class Bootstrap:
         self.snapshot("avant", "avant ha-bootstrap", "snapshot_before")
         self.connect()
         self.choose_plan()
-        self.backup_schedule()
+        if self.steps != ["hacs", "remote_ha", "liaisons"]:
+            self.backup_schedule()
         s = self.steps
         if "general" in s:
             self.run_step("general", "Réglages généraux", self.step_general)
@@ -2657,6 +2934,8 @@ class Bootstrap:
             self.run_step("ha_mcp", "HA-MCP (accès de Claude)", self.step_ha_mcp)
         if "acces_distant" in s:
             self.run_step("acces_distant", "Accès distant", self.step_acces_distant)
+        if "liaisons" in s:
+            self.run_step("liaisons", "Liaisons avec mes autres instances", self.step_liaisons)
         if "cloudflare" in s:
             self.run_step("cloudflare", "Cloudflare", self.step_cloudflare)
         self.finish()

@@ -40,9 +40,28 @@ Le profil ne fait que pré-cocher des étapes. Tout reste modifiable dans la lis
 | Boutique | Marketplace intégrée (HA 2026.11 et plus) : il accepte l'avertissement avec ton accord et relie GitHub seulement si nécessaire. Sur un HA plus ancien : HACS avec l'app Get HACS, et le code GitHub est guidé. |
 | HA-MCP *(option)* | Laisse Claude (claude.ai) lire et régler l'instance : compte claude.ai (identifiant au choix), compte de service `ha-mcp` (administrateur, accès local seulement), serveur en « connexion Home Assistant », outils fichiers et YAML. L'URL du connecteur est affichée. |
 | Remote Home Assistant *(option)* | Installé pour qu'une instance voie les entités d'autres instances. |
+| Liaisons *(option)* | Relie l'instance à tes autres instances. Voir plus bas. |
 | Accès distant *(option)* | Intégration privée `Basilik41/hass-acces-distant`, uniquement pour qui a un jeton d'accès. Il la pose par le File editor, en mode « réglages ». |
 | Proxy inverse | Autorise `172.30.33.0/24` par l'API de HA 2026.11 (pas de YAML), puis confirme le réglage. |
 | Cloudflare *(option)* | Choix de la protection, puis, dans cet ordre : certificat client demandé, règles WAF, tunnel, DNS, app Cloudflared et adresse externe. Il finit par un contrôle depuis l'extérieur. |
+
+### Liaisons entre instances
+
+Pour chaque instance à lire, le script :
+
+- se connecte une seule fois avec un administrateur de l'autre instance ;
+- y crée un **compte dédié** `liaison-<cette instance>` : non administrateur, réseau local seulement par défaut, avec un mot de passe que personne n'a besoin de connaître ;
+- fabrique avec ce compte un jeton longue durée ;
+- crée la liaison ici, **avec un filtre restrictif posé avant la première connexion** : rien n'est importé tant que la liste blanche n'est pas choisie (Remote Home-Assistant → Configurer), ce qui évite l'import total et ses milliers de doublons. Il passe pour cela par un import YAML ponctuel, retiré aussitôt avec le jeton ;
+- prépare l'autre instance si elle n'a pas encore Remote Home Assistant (avec ton accord, car elle redémarre une fois).
+
+Chaque liaison a son compte : pour en couper une, on supprime ce compte sur l'instance lue, sans toucher aux autres.
+
+On peut relancer **seulement cette partie** : choisis « Seulement la relier à mes autres instances » au démarrage, ou ajoute `--liaisons` à la commande :
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Basilik41/ha-bootstrap/main/install.sh)" _ --liaisons
+```
 
 ### Protection de l'accès extérieur
 
@@ -119,6 +138,7 @@ Scénarios couverts, sur Python 3.9 et 3.13 :
 - zone sans aucune règle, avec certificats d'appareils ;
 - accès par mot de passe seulement ;
 - reprise des personnes d'une instance précédente ;
+- liaison vers une 2ᵉ instance réelle (vraie Remote Home Assistant des deux côtés), puis relance sans doublon ;
 - compte de locataire ;
 - mises à jour Supervisor, Core et OS ;
 - instantané impossible.
