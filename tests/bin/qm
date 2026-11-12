@@ -18,7 +18,7 @@ elif a[:2] == ["guest", "cmd"]:
         {"name": "docker0", "ip-addresses": [{"ip-address": "172.30.232.1", "ip-address-type": "ipv4"}]}]))
 elif a[:1] == ["snapshot"]:
     if os.environ.get("HAB_TEST_SNAP_FAIL"):
-        print("snapshot feature is not available", file=sys.stderr); sys.exit(1)
+        print("snapshot feature is not available", file=sys.stderr); sys.exit(255)
     print(f"snapshot {a[2]} ok")
 elif a[:1] == ["start"]:
     pass

@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+import os, sys
+open(os.environ.get("HAB_TEST_QM_LOG", "/tmp/qm.log"), "a").write("vzdump " + " ".join(sys.argv[1:]) + "\n")
+print("INFO: Finished Backup of VM", sys.argv[1])

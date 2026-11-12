@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -311,6 +311,8 @@ class UI:
         tags = [t for t, _ in items]
         while True:
             if self.scripted:
+                LOG.write(f"[menu {key}] {title}: {text}")
+                print(f"\n== {title} ==\n{text}\n", flush=True)
                 v = self._scripted(key, default)
                 if v not in tags:
                     raise Abort(f"[test] choix inconnu pour {key} : {v}")
@@ -858,6 +860,27 @@ class Proxmox:
     def snapshot(self, vmid: str, name: str, desc: str):
         self.run("snapshot", vmid, name, "--description", desc, timeout=300)
 
+    def backup_storages(self) -> list[tuple[str, str]]:
+        """Stockages actifs acceptant les sauvegardes : [(nom, place libre lisible)]."""
+        r = subprocess.run(["pvesm", "status", "--content", "backup"], capture_output=True, text=True, timeout=60)
+        out = []
+        for line in r.stdout.splitlines()[1:]:
+            p = line.split()
+            if len(p) >= 6 and p[2] == "active":
+                try:
+                    free = f"{int(p[5]) / 1024 / 1024:.0f} Go libres"
+                except ValueError:
+                    free = ""
+                out.append((p[0], f"{p[1]}, {free}".strip(", ")))
+        return out
+
+    def vzdump(self, vmid: str, storage: str, note: str):
+        r = subprocess.run(["vzdump", vmid, "--storage", storage, "--mode", "snapshot", "--compress", "zstd",
+                            "--notes-template", note], capture_output=True, text=True, timeout=7200)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip()
+                               else "vzdump a échoué")
+
 
 # ───────────────────────────── outils ─────────────────────────────
 
@@ -1048,15 +1071,32 @@ class Bootstrap:
                         time.sleep(5)
                 ip = self.vm_ip(choice)
                 if ip:
-                    base = f"http://{ip}:8123"
+                    base = self.probe_base(ip)
         if not base:
             def check(v):
                 return None if re.match(r"^https?://[^/\s]+$", v) else "Forme attendue : http://192.168.1.50:8123"
-            base = self.ui.ask("url", "Adresse de Home Assistant", "Adresse locale de l'instance :",
+            base = self.ui.ask("url", "Adresse de Home Assistant",
+                               "Adresse locale de l'instance, telle que tu l'ouvres dans le navigateur\n"
+                               "(ex. http://192.168.1.50:8123, ou http://192.168.1.50 si HA est sur le port 80) :",
                                default="http://", validate=check)
         self.ha_ip = urllib.parse.urlparse(base).hostname or ""
         self.ha = HA(base, self.ui)
         self.ui.ok(f"Instance : {base}" + (f" (VM {self.vmid})" if self.vmid else ""))
+
+    def probe_base(self, ip: str) -> str | None:
+        """Trouve le port de Home Assistant (8123 par défaut, parfois 80)."""
+        cands = [f"http://{ip}:8123", f"http://{ip}"]
+        for _ in range(3):
+            for base in cands:
+                try:
+                    s, txt, _ = http("GET", base + "/auth/providers", local=True, timeout=5, raw=True)
+                except NetError:
+                    continue
+                if s == 200 and "homeassistant" in txt:
+                    return base
+            time.sleep(5)
+        self.ui.warn(f"Home Assistant ne répond ni sur {ip}:8123 ni sur {ip}:80 pour l'instant.")
+        return None if not self.ui.scripted else cands[0]
 
     def vm_ip(self, vmid: str) -> str | None:
         self.ui.say("Lecture de l'adresse IP par l'agent QEMU…")
@@ -1101,23 +1141,79 @@ class Bootstrap:
             self.report.append((f"Instantané « {desc} »", "ok", name))
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             self.ui.warn(f"instantané impossible : {e}")
-            if not self.ui.yesno(f"{key}.continue", "Instantané impossible",
-                                 f"{e}\n\nContinuer sans instantané ?", default=False):
-                raise Abort("Arrêt : pas d'instantané")
+            unsupported = "not available" in str(e) or "not supported" in str(e)
+            why = ("Le disque de cette VM est sur un stockage qui ne sait pas faire d'instantanés\n"
+                   "(LVM classique, ou fichier « raw » dans un dossier).\n\n" if unsupported else f"{e}\n\n")
+            items = [("backup", "Faire une sauvegarde complète de la VM à la place (recommandé)"),
+                     ("continue", "Continuer sans point de retour"),
+                     ("stop", "Arrêter")]
+            if unsupported:
+                why += ("Pour avoir des instantanés plus tard : Proxmox → VM → Matériel → disque →\n"
+                        "Action disque → Déplacer le stockage, vers un stockage LVM-Thin, ZFS,\n"
+                        "ou un dossier au format qcow2 (possible VM allumée).\n\n")
+            choice = self.ui.menu(f"{key}.fallback", "Instantané impossible", why + "Que faire ?", items,
+                                  "backup" if label == "avant" else "continue")
+            if choice == "stop":
+                raise Abort("Arrêt : pas de point de retour")
+            if choice == "backup":
+                self.full_backup(desc, key)
+
+    def full_backup(self, desc: str, key: str):
+        try:
+            stores = self.pve.backup_storages()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            stores = []
+            self.ui.warn(f"stockages illisibles : {e}")
+        if not stores:
+            if not self.ui.yesno(f"{key}.nobackup", "Pas de stockage de sauvegarde",
+                                 "Aucun stockage Proxmox n'accepte les sauvegardes (contenu « VZDump »).\n\n"
+                                 "Continuer sans point de retour ?", default=False):
+                raise Abort("Arrêt : pas de point de retour")
+            return
+        store = stores[0][0] if len(stores) == 1 else self.ui.menu(
+            f"{key}.storage", "Où sauvegarder ?", "Stockage de la sauvegarde :",
+            [(n, f"{n} ({info})") for n, info in stores], self.conf.get("backup_storage", stores[0][0]))
+        self.conf["backup_storage"] = store
+        self.save_conf()
+        self.ui.say(f"Sauvegarde complète de la VM {self.vmid} sur {store} (VM allumée, quelques minutes)…")
+        try:
+            self.pve.vzdump(self.vmid, store, f"ha-bootstrap : {desc}")
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            self.ui.warn(f"sauvegarde impossible : {e}")
+            if not self.ui.yesno(f"{key}.continue", "Sauvegarde impossible", f"{e}\n\nContinuer sans point de retour ?",
+                                 default=False):
+                raise Abort("Arrêt : pas de point de retour")
+            return
+        self.ui.ok(f"Sauvegarde complète sur {store}")
+        self.report.append((f"Sauvegarde « {desc} »", "ok", f"stockage {store} (Proxmox → VM → Sauvegarde → Restaurer)"))
 
     # ═════════════ 2. connexion ═════════════
     def wait_reachable(self):
         deadline = time.time() + 1800
         shown = 0.0
+        host = urllib.parse.urlparse(self.ha.base).hostname
+        port = urllib.parse.urlparse(self.ha.base).port or 8123
         while True:
             try:
                 return self.ha.onboarding()
-            except (NetError, HAError):
+            except (NetError, HAError) as e:
                 if time.time() > deadline:
                     raise Abort("Home Assistant injoignable depuis 30 min : vérifie la VM et le réseau.")
                 if time.time() - shown > 30:
-                    self.ui.say("… Home Assistant démarre (le premier démarrage peut prendre 20 min)")
                     shown = time.time()
+                    msg = str(e)
+                    if "refused" in msg.lower():
+                        try:  # l'Observer (port 4357) répond si l'OS tourne
+                            http("GET", f"http://{host}:4357/", local=True, timeout=5, raw=True)
+                            self.ui.warn(f"la VM répond, mais Home Assistant (port {port}) est arrêté ou redémarre. "
+                                         f"État : http://{host}:4357 — console de la VM : « ha core info », "
+                                         "« ha core start », « ha core logs ».")
+                        except NetError:
+                            self.ui.warn(f"rien ne répond sur {host} (port {port} fermé, Observer muet) : "
+                                         "la VM démarre-t-elle ? Est-ce la bonne adresse ?")
+                    else:
+                        self.ui.say(f"… Home Assistant ne répond pas encore ({msg[-90:]}). "
+                                    "Le premier démarrage peut prendre 20 min.")
                 time.sleep(10)
 
     def connect(self):
@@ -1237,7 +1333,7 @@ class Bootstrap:
             self.save_conf()
         data = {"location_name": self.instance_name, "country": "FR", "language": "fr", "currency": "EUR",
                 "time_zone": "Europe/Paris", "unit_system": "metric",
-                "internal_url": f"http://{self.ha_ip}:8123"}
+                "internal_url": self.ha.base}
         if coords:
             data.update(latitude=coords[0], longitude=coords[1])
         self.ha.call("config/core/update", **data)
@@ -1956,7 +2052,7 @@ class Bootstrap:
             tid = t["id"]
             self.ui.ok(f"Tunnel {tname} créé")
         cf.req("PUT", f"/accounts/{acc}/cfd_tunnel/{tid}/configurations",
-               {"config": {"ingress": [{"hostname": host, "service": "http://homeassistant:8123",
+               {"config": {"ingress": [{"hostname": host, "service": f"http://homeassistant:{self.ha_server_port()}",
                                         "originRequest": {}},
                                        {"service": "http_status:404"}]}})
         ttoken = cf.req("GET", f"/accounts/{acc}/cfd_tunnel/{tid}/token")
@@ -1984,7 +2080,7 @@ class Bootstrap:
             raise HAError("cloudflare", f"tunnel « {status} » : regarde le journal de l'app Cloudflared")
         steps.append("tunnel actif")
         # 5. adresses connues de Home Assistant
-        self.ha.call("config/core/update", external_url=f"https://{host}", internal_url=f"http://{self.ha_ip}:8123")
+        self.ha.call("config/core/update", external_url=f"https://{host}", internal_url=self.ha.base)
         # 6. contrôle : sans certificat, Cloudflare doit refuser
         verdict = self.public_check(host)
         steps.append(verdict)
@@ -2005,6 +2101,16 @@ class Bootstrap:
         except CFError:
             return False
         return t.get("name") == name and not t.get("deleted_at")
+
+    def ha_server_port(self) -> int:
+        """Port réel du serveur web de HA (vu par Cloudflared, sur le réseau interne de HAOS)."""
+        try:
+            port = ((self.ha.call("http/config") or {}).get("stable") or {}).get("server_port")
+            if port:
+                return int(port)
+        except HAError:
+            pass
+        return urllib.parse.urlparse(self.ha.base).port or (443 if self.ha.base.startswith("https") else 80)
 
     def cloudflare_client(self) -> Cloudflare:
         token = self.vault.get("cloudflare_token")

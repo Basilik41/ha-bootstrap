@@ -438,6 +438,23 @@ def scenario_failures():
     check("[majs] deux redémarrages attendus et suivis", exits == 2, str(exits))
     check("[majs] plus rien en attente", not any(os.path.exists(os.path.join(CFG, f"hab_update_{n}")) for n in ("supervisor", "core", "os")))
 
+    # e) instantané impossible (stockage sans instantanés) → sauvegarde complète proposée, choix du stockage
+    qlog = os.path.join(WORK, "qm.log")
+    n0 = open(qlog).read().count("vzdump ")
+    answers = {"target": "105", "snapshot_before": True, "snapshot_before.fallback": "backup",
+               "snapshot_before.storage": "nas-backup", "login_password": PWD, "profile": "perso",
+               "instance_name": "Centrale", "steps": ["general"], "coords": "", "summary": "ok", "snapshot_after": False}
+    out = run_script("snapfail", answers, extra_env={"HAB_TEST_SNAP_FAIL": "1"})
+    log = open(qlog).read()
+    check("[instantané] sauvegarde complète faite sur le stockage choisi (stockage inactif ignoré)",
+          log.count("vzdump ") == n0 + 1 and "vzdump 105 --storage nas-backup --mode snapshot" in log
+          and "Sauvegarde complète sur nas-backup" in out, log[-300:])
+    check("[instantané] explication et façon d'activer les instantanés", "Déplacer le stockage" in out)
+    answers = {"target": "105", "snapshot_before": True, "snapshot_before.fallback": "stop"}
+    out = run_script("snapstop", answers, extra_env={"HAB_TEST_SNAP_FAIL": "1"}, expect_rc=2)
+    check("[instantané] « Arrêter » → arrêt propre", "pas de point de retour" in out)
+
+
     # g) double authentification (TOTP) activée sur le compte : le code est demandé et accepté
     import base64, hashlib, hmac, struct as st
 
@@ -457,11 +474,6 @@ def scenario_failures():
                "summary": "ok", "snapshot_after": False}
     out = run_script("mfa", answers)
     check("[mfa] connexion avec code à 6 chiffres", "Connecté en tant que Richard" in out and "Connexion refusée" not in out, out[-800:])
-
-    # e) instantané Proxmox impossible → on demande, refus = arrêt propre (code 2)
-    answers = {"target": "105", "snapshot_before": True, "snapshot_before.continue": False}
-    out = run_script("snapfail", answers, extra_env={"HAB_TEST_SNAP_FAIL": "1"}, expect_rc=2)
-    check("[échec] instantané impossible → arrêt demandé", "pas d'instantané" in out)
 
 
 if __name__ == "__main__":
