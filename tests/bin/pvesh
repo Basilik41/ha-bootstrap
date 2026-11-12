@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Faux pvesh : tâches de sauvegarde programmées (/cluster/backup), état dans HAB_TEST_PVESH."""
+import json, os, secrets, sys
+st_path = os.environ.get("HAB_TEST_PVESH", "/tmp/pvesh.json")
+jobs = json.load(open(st_path)) if os.path.exists(st_path) else []
+a = [x for x in sys.argv[1:] if x not in ("--output-format", "json")]
+open(os.environ.get("HAB_TEST_QM_LOG", "/tmp/qm.log"), "a").write("pvesh " + " ".join(a) + "\n")
+opts = {a[i][2:]: a[i + 1] for i in range(2, len(a) - 1, 2) if a[i].startswith("--")}
+if a[:2] == ["get", "/cluster/backup"]:
+    print(json.dumps(jobs))
+elif a[:2] == ["create", "/cluster/backup"]:
+    for k in ("vmid", "storage", "schedule"):
+        if k not in opts:
+            print(f"400 Parameter verification failed: {k}", file=sys.stderr); sys.exit(255)
+    jobs.append(dict(opts, id="backup-" + secrets.token_hex(4), type="vzdump", enabled=1))
+    json.dump(jobs, open(st_path, "w")); print("null")
+elif a[0] == "set" and a[1].startswith("/cluster/backup/"):
+    j = next((j for j in jobs if j["id"] == a[1].rsplit("/", 1)[1]), None)
+    if not j:
+        print("404 not found", file=sys.stderr); sys.exit(255)
+    j.update(opts); json.dump(jobs, open(st_path, "w")); print("null")
+else:
+    print("pvesh simulé : inconnu", a, file=sys.stderr); sys.exit(255)

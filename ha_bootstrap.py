@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -874,6 +874,15 @@ class Proxmox:
                 out.append((p[0], f"{p[1]}, {free}".strip(", ")))
         return out
 
+    def pvesh(self, *args, timeout=60):
+        r = subprocess.run(["pvesh", *args, "--output-format", "json"], capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "pvesh a échoué")
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def backup_jobs(self) -> list[dict]:
+        return self.pvesh("get", "/cluster/backup") or []
+
     def vzdump(self, vmid: str, storage: str, note: str):
         r = subprocess.run(["vzdump", vmid, "--storage", storage, "--mode", "snapshot", "--compress", "zstd",
                             "--notes-template", note], capture_output=True, text=True, timeout=7200)
@@ -1186,6 +1195,87 @@ class Bootstrap:
             return
         self.ui.ok(f"Sauvegarde complète sur {store}")
         self.report.append((f"Sauvegarde « {desc} »", "ok", f"stockage {store} (Proxmox → VM → Sauvegarde → Restaurer)"))
+
+    def backup_schedule(self):
+        """Sauvegarde automatique de la VM par Proxmox (une bonne fois pour toutes)."""
+        if not (self.vmid and self.pve.available and shutil.which("pvesh")):
+            return
+        try:
+            jobs = self.pve.backup_jobs()
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+            self.ui.warn(f"sauvegardes programmées illisibles : {e}")
+            return
+        vm = str(self.vmid)
+
+        def covers(j):
+            if not j.get("enabled", 1) or str(j.get("enabled", 1)) == "0":
+                return False
+            if str(j.get("all", 0)) == "1":
+                return vm not in str(j.get("exclude", "")).replace(" ", "").split(",")
+            return vm in str(j.get("vmid", "")).replace(" ", "").split(",")
+        cover = [j for j in jobs if covers(j)]
+        if cover:
+            j = cover[0]
+            self.ui.ok(f"Sauvegarde programmée déjà en place pour la VM {vm} ({j.get('schedule')} → {j.get('storage')})")
+            self.report.append(("Sauvegarde programmée", "ok", f"déjà en place : {j.get('schedule')} → {j.get('storage')}"))
+            return
+        if any(j.get("pool") for j in jobs):
+            self.ui.warn("une sauvegarde programmée vise un pool : vérifie qu'il contient cette VM")
+        if not self.ui.yesno("backup_job", "Sauvegarde automatique",
+                             f"Aucune sauvegarde programmée ne couvre la VM {vm}.\n\n"
+                             "En programmer une maintenant, une bonne fois pour toutes ?\n"
+                             "(Proxmox la fera tout seul, VM allumée, et gardera un historique.)", default=True):
+            self.next_steps.append(f"Aucune sauvegarde programmée pour la VM {vm} : Proxmox → Centre de données → Sauvegarde.")
+            return
+        try:
+            stores = self.pve.backup_storages()
+        except (OSError, subprocess.TimeoutExpired):
+            stores = []
+        if not stores:
+            self.next_steps.append("Sauvegarde programmée impossible : aucun stockage Proxmox n'accepte les sauvegardes "
+                                   "(Centre de données → Stockage → contenu « Sauvegarde VZDump »).")
+            return
+        others = [j for j in jobs if not j.get("all") and j.get("vmid") and str(j.get("enabled", 1)) != "0"]
+        target = "new"
+        if others:
+            items = [(j["id"], f"Ajouter à « {j.get('comment') or j['id']} » ({j.get('schedule')} → {j.get('storage')}, "
+                               f"VM {j.get('vmid')})") for j in others]
+            items.append(("new", "Créer une sauvegarde programmée pour cette VM"))
+            target = self.ui.menu("backup_job.target", "Sauvegarde automatique",
+                                  "Tu as déjà des sauvegardes programmées :", items, others[0]["id"])
+        try:
+            if target != "new":
+                j = next(x for x in others if x["id"] == target)
+                vmids = [v for v in str(j["vmid"]).replace(" ", "").split(",") if v] + [vm]
+                self.pve.pvesh("set", f"/cluster/backup/{target}", "--vmid", ",".join(vmids))
+                detail = f"VM ajoutée à « {j.get('comment') or target} » ({j.get('schedule')} → {j.get('storage')})"
+            else:
+                store = stores[0][0] if len(stores) == 1 else self.ui.menu(
+                    "backup_job.storage", "Où sauvegarder ?", "Stockage des sauvegardes :",
+                    [(n, f"{n} ({info})") for n, info in stores], self.conf.get("backup_storage", stores[0][0]))
+                when = self.ui.menu("backup_job.when", "Quand ?", "Fréquence des sauvegardes :",
+                                    [("03:00", "Chaque nuit à 3 h (recommandé)"),
+                                     ("sun 03:00", "Chaque dimanche à 3 h"),
+                                     ("mon..fri 03:00", "Du lundi au vendredi à 3 h")], "03:00")
+                keep = self.ui.menu("backup_job.keep", "Combien en garder ?", "Historique gardé :",
+                                    [("keep-daily=7,keep-weekly=4,keep-monthly=3",
+                                      "7 jours + 4 semaines + 3 mois (recommandé)"),
+                                     ("keep-last=3", "Les 3 dernières seulement (peu de place)"),
+                                     ("keep-daily=14,keep-weekly=8,keep-monthly=12", "14 jours + 8 semaines + 12 mois")],
+                                    "keep-daily=7,keep-weekly=4,keep-monthly=3")
+                self.pve.pvesh("create", "/cluster/backup", "--vmid", vm, "--storage", store, "--schedule", when,
+                               "--mode", "snapshot", "--compress", "zstd", "--enabled", "1",
+                               "--prune-backups", keep, "--comment", f"ha-bootstrap : {self.instance_name or 'Home Assistant'}"[:200],
+                               "--notes-template", "{{guestname}}")
+                self.conf["backup_storage"] = store
+                self.save_conf()
+                detail = f"{when} → {store} ({keep})"
+        except (RuntimeError, ValueError, StopIteration, subprocess.TimeoutExpired) as e:
+            self.ui.warn(f"sauvegarde programmée non créée : {e}")
+            self.next_steps.append(f"Sauvegarde programmée à créer : Proxmox → Centre de données → Sauvegarde ({e}).")
+            return
+        self.ui.ok(f"Sauvegarde programmée : {detail}")
+        self.report.append(("Sauvegarde programmée", "ok", detail))
 
     # ═════════════ 2. connexion ═════════════
     def wait_reachable(self):
@@ -2415,6 +2505,7 @@ class Bootstrap:
         self.snapshot("avant", "avant ha-bootstrap", "snapshot_before")
         self.connect()
         self.choose_plan()
+        self.backup_schedule()
         s = self.steps
         if "general" in s:
             self.run_step("general", "Réglages généraux", self.step_general)

@@ -93,6 +93,7 @@ def run_script(name, answers, extra_env=None, expect_rc=0):
                HAB_GITHUB_API=CLOUD + "/github",
                HAB_PUBLIC_CHECK_URL=CLOUD + "/public/{host}/manifest.json",
                HAB_TEST_VM_IP=IP, HAB_TEST_QM_LOG=os.path.join(WORK, "qm.log"),
+               HAB_TEST_PVESH=os.path.join(WORK, "pvesh.json"),
                PATH=os.path.join(HERE, "bin") + ":" + os.environ["PATH"])
     env.update(extra_env or {})
     t0 = time.time()
@@ -166,7 +167,7 @@ def scenario_fresh():
         "github_token": ["mauvais-jeton", "gh-good-token"], "remember.github_token": True,
         "cf_token": "cf-good-token", "remember.cloudflare_token": True,
         "host": "ha-centrale.degest.test",
-        "waf_confirm": True,
+        "waf_confirm": True, "backup_job.storage": "nas-backup",
         "summary": "ok", "secrets": "ok", "snapshot_after": True,
     }
     out = run_script("neuve", answers)
@@ -271,6 +272,11 @@ def scenario_fresh():
           out.count("(identifiant julie)") >= 1 and "(identifiant claude)" in out and "(identifiant ha-mcp)" not in out)
     qm = open(os.path.join(WORK, "qm.log")).read()
     check("[neuve] instantanés Proxmox avant et après", "snapshot 105 hab_avant_" in qm and "snapshot 105 hab_socle_" in qm, qm)
+    jobs = json.load(open(os.path.join(WORK, "pvesh.json")))
+    check("[neuve] sauvegarde programmée créée : chaque nuit, nas-backup, 7j+4s+3m, VM 105",
+          len(jobs) == 1 and jobs[0]["vmid"] == "105" and jobs[0]["schedule"] == "03:00" and jobs[0]["storage"] == "nas-backup"
+          and jobs[0]["prune-backups"] == "keep-daily=7,keep-weekly=4,keep-monthly=3" and jobs[0]["mode"] == "snapshot"
+          and jobs[0]["comment"] == "ha-bootstrap : Centrale", json.dumps(jobs))
     check("[neuve] URL du connecteur Claude donnée", f"https://ha-centrale.degest.test{wpath}" in out)
     toks = [t for t in ha.call("auth/refresh_tokens") if t.get("client_id") == HA_URL + "/"]
     check("[neuve] session du script supprimée à la fin (reste celle du banc)", len(toks) == 1, json.dumps(toks)[:300])
@@ -293,6 +299,8 @@ def scenario_rerun():
     check("[relance] aucune nouvelle règle, tunnel ou DNS", len(after["ruleset"]["rules"]) == 6 and len(after["tunnels"]) == 1
           and len(after["dns"]) == 1 and after["ruleset"] == before["ruleset"])
     check("[relance] « règles WAF déjà en place »", "règles WAF déjà en place" in out)
+    check("[relance] sauvegarde programmée reconnue, pas de doublon",
+          "Sauvegarde programmée déjà en place" in out and len(json.load(open(os.path.join(WORK, "pvesh.json")))) == 1)
     check("[relance] pas de redémarrage inutile", "aucun redémarrage nécessaire" in out)
     check("[relance] comptes déjà là", "créés : aucun" in out)
     check("[relance] Accès distant déjà à jour", "déjà à jour" in out)
@@ -441,8 +449,11 @@ def scenario_failures():
     # e) instantané impossible (stockage sans instantanés) → sauvegarde complète proposée, choix du stockage
     qlog = os.path.join(WORK, "qm.log")
     n0 = open(qlog).read().count("vzdump ")
+    json.dump([{"id": "backup-yuno", "vmid": "100", "schedule": "sat 02:00", "storage": "local", "enabled": 1,
+                "comment": "Yunohost", "type": "vzdump"}], open(os.path.join(WORK, "pvesh.json"), "w"))
     answers = {"target": "105", "snapshot_before": True, "snapshot_before.fallback": "backup",
-               "snapshot_before.storage": "nas-backup", "login_password": PWD, "profile": "perso",
+               "snapshot_before.storage": "nas-backup", "backup_job.target": "backup-yuno",
+               "login_password": PWD, "profile": "perso",
                "instance_name": "Centrale", "steps": ["general"], "coords": "", "summary": "ok", "snapshot_after": False}
     out = run_script("snapfail", answers, extra_env={"HAB_TEST_SNAP_FAIL": "1"})
     log = open(qlog).read()
@@ -450,6 +461,9 @@ def scenario_failures():
           log.count("vzdump ") == n0 + 1 and "vzdump 105 --storage nas-backup --mode snapshot" in log
           and "Sauvegarde complète sur nas-backup" in out, log[-300:])
     check("[instantané] explication et façon d'activer les instantanés", "Déplacer le stockage" in out)
+    jobs = json.load(open(os.path.join(WORK, "pvesh.json")))
+    check("[instantané] VM ajoutée à la sauvegarde programmée existante", len(jobs) == 1 and jobs[0]["vmid"] == "100,105",
+          json.dumps(jobs))
     answers = {"target": "105", "snapshot_before": True, "snapshot_before.fallback": "stop"}
     out = run_script("snapstop", answers, extra_env={"HAB_TEST_SNAP_FAIL": "1"}, expect_rc=2)
     check("[instantané] « Arrêter » → arrêt propre", "pas de point de retour" in out)

@@ -31,7 +31,8 @@ Le profil ne fait que pré-cocher des étapes. Tout reste modifiable dans la lis
 | Étape | Détail |
 |---|---|
 | Choix de la VM | Il liste les VM Proxmox et lit l'adresse IP par l'agent QEMU. Il peut aussi créer une VM HAOS avec le script community-scripts. |
-| Instantanés | Un instantané Proxmox est pris **avant** et **après** (sur proposition). C'est le point de retour. |
+| Instantanés | Un instantané Proxmox est pris **avant** et **après** (sur proposition). Si le stockage n'en fait pas, le script propose une sauvegarde complète à la place et explique comment activer les instantanés. |
+| Sauvegarde programmée | Si aucune sauvegarde Proxmox ne couvre la VM, le script propose d'en programmer une (chaque nuit à 3 h, 7 jours + 4 semaines + 3 mois). Il peut aussi ajouter la VM à une sauvegarde programmée existante. |
 | Compte et écran d'accueil | Il crée le compte du propriétaire sur une instance neuve, ou se connecte (double authentification gérée). Il termine aussi l'écran d'accueil. |
 | Réglages généraux | Nom, France, euro, Europe/Paris, unités métriques, coordonnées GPS, adresse interne. |
 | Mises à jour | Supervisor, puis Core, puis OS. Le script attend chaque redémarrage et vérifie la version. |
