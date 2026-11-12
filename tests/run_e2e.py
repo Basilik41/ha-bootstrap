@@ -357,8 +357,14 @@ def grange_setup():
 
 def scenario_liaisons():
     g = grange_setup()
+    guuid = hb.http("GET", R_URL + "/api/remote_homeassistant/discovery", local=True,
+                    headers={"Authorization": f"Bearer {g.token()}"})[1]["uuid"]
+    hl = ha_session()
+    z = hl.call("hab_test/zeroconf", host="127.0.0.1", port=8124, uuid=guuid, name="Grange")
+    check("[liaisons] annonce mDNS de la Grange simulée", z.get("type") == "form", json.dumps(z))
+    hl.ws_close()
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD,
-               "liaison.add": [True, False], "liaison.url": R_URL, "liaison.username": "richard",
+               "liaison.known": [R_URL], "liaison.add": False, "liaison.username": "richard",
                "liaison.password": PWD, "liaison.local_only": True, "summary": "ok", "snapshot_after": False}
     out = run_script("liaisons", answers, args=["--liaisons"])
     users = {u["username"]: u for u in g.call("config/auth/list") if u.get("username")}
@@ -388,7 +394,10 @@ def scenario_liaisons():
           hb.http("GET", R_URL + "/api/", headers={"Authorization": f"Bearer {tok}"}, local=True)[0] == 200)
     check("[liaisons] mode « seulement les liaisons » : aucune autre étape", "▶ Comptes" not in out and "▶ Cloudflare" not in out)
     # relance : rien de recréé
-    out = run_script("liaisons2", dict(answers, **{"liaison.known": [], "liaison.add": [True, False]}), args=["--liaisons"])
+    check("[liaisons] Grange proposée d'office (trouvée sur le réseau), sans saisie d'adresse",
+          "Instances trouvées" in out and "Adresse de l'autre instance" not in out, out[-800:])
+    out = run_script("liaisons2", dict(answers, **{"liaison.known": [], "liaison.add": [True, False],
+                                                   "liaison.url": R_URL}), args=["--liaisons"])
     entries = json.load(open(os.path.join(CFG, ".storage", "core.config_entries")))["data"]["entries"]
     users2 = [u for u in g.call("config/auth/list") if (u.get("username") or "").startswith("liaison-")]
     check("[liaisons] relance : « déjà reliée », ni doublon de liaison ni de compte",

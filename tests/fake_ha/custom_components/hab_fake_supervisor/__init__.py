@@ -200,6 +200,25 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
             connection.send_error(msg["id"], "unknown_error", str(e))
 
     websocket_api.async_register_command(hass, ws_api)
+
+    @websocket_api.require_admin
+    @websocket_api.websocket_command({vol.Required("type"): "hab_test/zeroconf", vol.Required("host"): str,
+                                      vol.Required("port"): int, vol.Required("uuid"): str, vol.Required("name"): str})
+    @websocket_api.async_response
+    async def ws_zeroconf(hass, connection, msg):
+        """Simule l'annonce mDNS d'une autre instance (le banc n'a pas de multicast)."""
+        from ipaddress import ip_address
+        from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
+        info = ZeroconfServiceInfo(ip_address=ip_address(msg["host"]), ip_addresses=[ip_address(msg["host"])],
+                                   port=msg["port"], hostname="grange.local.", type="_home-assistant._tcp.local.",
+                                   name=f"{msg['name']}._home-assistant._tcp.local.",
+                                   properties={"uuid": msg["uuid"], "location_name": msg["name"],
+                                               "internal_url": f"http://{msg['host']}:{msg['port']}",
+                                               "base_url": f"http://{msg['host']}:{msg['port']}"})
+        r = await hass.config_entries.flow.async_init("remote_homeassistant", context={"source": "zeroconf"}, data=info)
+        connection.send_result(msg["id"], {"type": r.get("type"), "flow_id": r.get("flow_id")})
+
+    websocket_api.async_register_command(hass, ws_zeroconf)
     hass.http.register_view(FakeIngress(hass, st))
     return True
 

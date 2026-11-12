@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -346,6 +346,8 @@ class UI:
     def checklist(self, key: str, title: str, text: str, items: list[tuple[str, str, bool]]) -> list[str]:
         if self.scripted:
             self.asked.append(key)
+            print(f"\n== {title} ==\n{text}\n" + "\n".join(f"  [{'x' if on else ' '}] {lab}" for _, lab, on in items),
+                  flush=True)
             v = self.answers.get(key, [t for t, _, on in items if on])
             if v and isinstance(v[0], list):  # plusieurs passages : liste de listes
                 v = v.pop(0)
@@ -2186,16 +2188,18 @@ class Bootstrap:
         local_entries = self.ha.entries("remote_homeassistant")
         titles = {e.get("title", "").removesuffix(" (YAML)") for e in local_entries}
         targets = []
-        known = [i for i in self.conf.get("instances", []) if i.get("base") != self.ha.base]
-        if known:
-            items = [(i["base"], f"{i['name']} ({i['base']})" + (" — déjà reliée" if i["name"] in titles else ""),
-                      i["name"] not in titles) for i in known]
+        self.ui.say("Recherche des autres instances (réseau local, ce serveur Proxmox, instances déjà vues)…")
+        cands = self.discover_instances()
+        if cands:
+            items = [(base, f"{name} ({base})" + (" — déjà reliée" if name in titles else ""), name not in titles)
+                     for base, name in cands.items()]
             targets += self.ui.checklist("liaison.known", "Relier à…",
-                                         f"Instances que {self.instance_name} doit voir :", items)
+                                         f"Instances trouvées. Coche celles que {self.instance_name} doit voir :", items)
         while self.ui.yesno("liaison.add", "Relier à une autre instance",
-                            ("Instances choisies : " + ", ".join(targets) + "\n\n" if targets else "")
-                            + f"Ajouter une instance que {self.instance_name} doit voir, par son adresse locale ?",
-                            default=not targets):
+                            ("Choisies : " + ", ".join(cands.get(t, t) for t in targets) + "\n\n" if targets else "")
+                            + ("Une instance manque à la liste ? Ajouter son adresse ?" if cands
+                               else "Aucune instance trouvée automatiquement. Ajouter une adresse ?"),
+                            default=not cands):
             url = self.ui.ask("liaison.url", "Adresse de l'autre instance",
                               "Adresse locale, telle qu'on l'ouvre dans le navigateur\n"
                               "(ex. http://10.20.20.126:8123, ou http://10.10.1.108 si elle est sur le port 80) :",
@@ -2230,6 +2234,58 @@ class Bootstrap:
         self.next_steps.append("Couper une liaison : supprime le compte " + ", ".join(
             sorted({f"« {i['account']} » sur {i['name']}" for i in instances})) + " (Paramètres → Personnes → Utilisateurs).")
         return ", ".join(made + done)
+
+    def discover_instances(self) -> dict:
+        """{adresse: nom} des autres Home Assistant visibles : mDNS (via Remote HA), Proxmox, déjà vus."""
+        found: dict[str, str] = {}
+        me = urllib.parse.urlparse(self.ha.base)
+        # 1. annoncées sur le réseau (mDNS) : Remote HA ouvre une découverte pour chacune
+        try:
+            for f in self.ha.call("config_entries/flow/progress") or []:
+                if f.get("handler") != "remote_homeassistant" or (f.get("context") or {}).get("source") != "zeroconf":
+                    continue
+                r = self.ha.flow_step(f["flow_id"]) or {}
+                d = {x.get("name"): x.get("default") for x in r.get("data_schema") or [] if isinstance(x, dict)}
+                if d.get("host"):
+                    scheme = "https" if d.get("secure") else "http"
+                    port = d.get("port") or (443 if scheme == "https" else 80)
+                    base = f"{scheme}://{d['host']}" + ("" if port in (80, 443) else f":{port}")
+                    name = ((f.get("context") or {}).get("title_placeholders") or {}).get("name") or d["host"]
+                    found[base] = name
+        except HAError as e:
+            LOG.write(f"découverte mDNS : {e}")
+        # 2. autres VM de ce serveur Proxmox qui font tourner Home Assistant
+        if self.pve.available:
+            try:
+                for vm in self.pve.vms():
+                    if vm["vmid"] == self.vmid or vm["status"] != "running":
+                        continue
+                    try:
+                        ips = self.pve.ips(vm["vmid"])
+                    except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+                        continue
+                    for ip in ips[:2]:
+                        base = self.quick_probe(ip)
+                        if base and base not in found:
+                            found[base] = f"VM {vm['vmid']} {vm['name']}"
+            except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                pass
+        # 3. instances déjà préparées depuis ce serveur
+        for i in self.conf.get("instances", []):
+            found.setdefault(i["base"], i["name"])
+        return {b: n for b, n in found.items()
+                if urllib.parse.urlparse(b).hostname != me.hostname or urllib.parse.urlparse(b).port != me.port}
+
+    @staticmethod
+    def quick_probe(ip: str) -> str | None:
+        for base in (f"http://{ip}:8123", f"http://{ip}"):
+            try:
+                s, txt, _ = http("GET", base + "/auth/providers", local=True, timeout=3, raw=True)
+            except NetError:
+                continue
+            if s == 200 and "homeassistant" in txt:
+                return base
+        return None
 
     def link_prepare(self, base: str, local_only: bool, titles: set) -> dict | None:
         """Sur l'autre instance : compte dédié + jeton longue durée. Renvoie la ligne d'import."""
