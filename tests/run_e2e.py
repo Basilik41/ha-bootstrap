@@ -166,7 +166,7 @@ def scenario_fresh():
         "store_warning": True, "github_code": "ok",
         "github_token": ["mauvais-jeton", "gh-good-token"], "remember.github_token": True,
         "cf_token": "cf-good-token", "remember.cloudflare_token": True,
-        "host": "ha-centrale.degest.test",
+        "host_label": "ha-centrale",
         "waf_confirm": True, "backup_job.storage": "nas-backup",
         "summary": "ok", "secrets": "ok", "snapshot_after": True,
     }
@@ -335,7 +335,7 @@ def scenario_failures():
     # b) sous-domaine déjà pris par un autre enregistrement → on ne l'écrase pas
     cloud("/test/set", {"dns": before["dns"] + [{"id": "dns-x", "name": "ha-autre.degest.test", "type": "A", "content": "1.2.3.4", "proxied": False}]})
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "perso",
-               "instance_name": "Autre", "steps": ["cloudflare"], "host": "ha-autre.degest.test",
+               "instance_name": "Autre", "steps": ["cloudflare"], "host_label": "ha-autre",
                "waf_confirm": True, "dns_replace": False, "summary": "ok", "snapshot_after": False}
     out = run_script("dns", answers)
     s = cloud()
@@ -347,7 +347,7 @@ def scenario_failures():
     # c) limite de règles de l'offre atteinte → message clair, rien de cassé
     cloud("/test/set", {"rule_limit": len(s["ruleset"]["rules"])})
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "perso",
-               "instance_name": "Troisieme", "steps": ["cloudflare"], "host": "ha-troisieme.degest.test",
+               "instance_name": "Troisieme", "steps": ["cloudflare"], "host_label": "ha-troisieme",
                "waf_confirm": True, "error.cloudflare": "skip", "summary": "ok", "snapshot_after": False}
     out = run_script("limite", answers)
     check("[échec] limite de règles expliquée", "limite de ton offre" in out, out[-1200:])
@@ -355,9 +355,10 @@ def scenario_failures():
     cloud("/test/set", {"rule_limit": 10})
 
     # d) chez un ami : zone sans aucune règle, offre sans Super Bot Fight, certificats créés par le script
-    cloud("/test/set", {"ruleset": None, "mtls": [], "no_sbfm": True})
+    cloud("/test/set", {"ruleset": None, "mtls": [], "no_sbfm": True,
+                        "extra_zones": [{"id": "zone-autre", "name": "paul-maison.test", "account": {"id": "acc0123456789"}}]})
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "principal",
-               "instance_name": "Chez Paul", "steps": ["ha_mcp", "cloudflare"], "host": "ha-paul.degest.test",
+               "instance_name": "Chez Paul", "steps": ["ha_mcp", "cloudflare"], "zone": "degest.test", "host_label": "ha-paul",
                "waf_confirm": True, "cert.add": [True, True, False], "cert.name": ["telephone-paul", "pc-paul"],
                "summary": "ok", "secrets": "ok", "snapshot_after": False}
     out = run_script("ami", answers)
@@ -398,14 +399,14 @@ def scenario_failures():
     # d2) accès par mot de passe seulement : pas de règle, pas de certificat, joignable
     before = cloud()
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD, "profile": "perso",
-               "instance_name": "Libre", "steps": ["cloudflare"], "host": "ha-libre.degest.test", "cf_mode": "login",
+               "instance_name": "Libre", "steps": ["cloudflare"], "host_label": "ha-libre", "cf_mode": "login",
                "summary": "ok", "snapshot_after": False}
     out = run_script("libre", answers)
     after = cloud()
     check("[libre] aucune règle ni certificat ajouté", after["ruleset"] == before["ruleset"] and after["mtls"] == before["mtls"])
     check("[libre] joignable avec le mot de passe Home Assistant", "joignable (mot de passe Home Assistant)" in out, out[-600:])
     check("[libre] aucune question de certificat", "Certificats des appareils" not in out)
-    cloud("/test/set", {"no_sbfm": False})
+    cloud("/test/set", {"no_sbfm": False, "extra_zones": []})
 
     # h) comptes : reprise des personnes d'une instance précédente, puis locataire
     cp = os.path.join(CONF, "config.json")

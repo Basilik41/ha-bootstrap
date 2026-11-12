@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -2093,12 +2093,17 @@ class Bootstrap:
     # -- Cloudflare --
     def step_cloudflare(self):
         cf = self.cloudflare_client()
-        zone_hint = self.conf.get("zone", "")
-        default_host = f"ha-{self.instance_slug}.{zone_hint}" if zone_hint else ""
-        host = self.ui.ask("host", "Adresse publique", "Sous-domaine public de cette instance :",
-                           default=self.conf.get(f"host.{self.instance_slug}", default_host),
-                           validate=lambda v: None if HOST_RE.match(v.lower()) else "Exemple : ha-centrale.mondomaine.fr").lower()
-        zone = cf.find_zone(host)
+        zone = self.choose_zone(cf)
+        zname = zone["name"]
+        remembered = self.conf.get(f"host.{self.instance_slug}", "")
+        default_label = remembered[: -len(zname) - 1] if remembered.endswith("." + zname) else f"ha-{self.instance_slug}"
+        label = self.ui.ask("host_label", "Adresse publique",
+                            f"Début de l'adresse publique de cette instance :\n\n    <début>.{zname}\n\n"
+                            "Lettres minuscules, chiffres et tirets (ex. ha-centrale).",
+                            default=default_label,
+                            validate=lambda v: None if re.match(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$", v.lower())
+                            else "Minuscules, chiffres et tirets ; ni espace ni point au début ou à la fin.").lower()
+        host = f"{label}.{zname}"
         zid, zname = zone["id"], zone["name"]
         acc = (zone.get("account") or {}).get("id")
         if not acc:
@@ -2201,6 +2206,25 @@ class Bootstrap:
         except HAError:
             pass
         return urllib.parse.urlparse(self.ha.base).port or (443 if self.ha.base.startswith("https") else 80)
+
+    def choose_zone(self, cf: Cloudflare) -> dict:
+        """Domaines visibles par le jeton : un seul → pris d'office, sinon choix dans une liste."""
+        zones, page = [], 1
+        while True:
+            res = cf.req("GET", "/zones", params={"per_page": 50, "page": page, "status": "active"}) or []
+            zones += res
+            if len(res) < 50:
+                break
+            page += 1
+        if not zones:
+            raise HAError("cloudflare", "le jeton ne voit aucun domaine actif : ajoute la zone dans ses ressources")
+        if len(zones) == 1:
+            self.ui.ok(f"Domaine Cloudflare : {zones[0]['name']}")
+            return zones[0]
+        names = sorted(z["name"] for z in zones)
+        pick = self.ui.menu("zone", "Domaine", "Sur quel domaine publier cette instance ?",
+                            [(n, n) for n in names], self.conf.get("zone") if self.conf.get("zone") in names else names[0])
+        return next(z for z in zones if z["name"] == pick)
 
     def cloudflare_client(self) -> Cloudflare:
         token = self.vault.get("cloudflare_token")

@@ -154,7 +154,8 @@ class H(BaseHTTPRequestHandler):
             if not self.perm("zone"):
                 return
             name = q.get("name")
-            return self.ok([z] if (name is None or name == z["name"]) else [])
+            allz = [z] + STATE.get("extra_zones", [])
+            return self.ok([x for x in allz if name is None or name == x["name"]])
         m = re.match(rf"^/accounts/{acc}/cfd_tunnel(?:/([^/]+))?(?:/(configurations|token))?$", path)
         if m:
             if not self.perm("tunnel"):
