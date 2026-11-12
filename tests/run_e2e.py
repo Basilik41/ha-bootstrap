@@ -356,6 +356,17 @@ def grange_setup():
 
 
 def scenario_liaisons():
+    # connexion restée inactive plus longtemps que le « ping » de HA (pendant une saisie) : renouvelée
+    h = ha_session()
+    h.call("get_config")
+    time.sleep(200)
+    try:
+        ok = h.call("get_config").get("state") == "RUNNING"
+    except Exception as e:  # noqa
+        ok = False
+        print("   ", e)
+    check("[ws] appel après 200 s d'inactivité (HA a coupé la connexion entre-temps)", ok)
+    h.ws_close()
     g = grange_setup()
     guuid = hb.http("GET", R_URL + "/api/remote_homeassistant/discovery", local=True,
                     headers={"Authorization": f"Bearer {g.token()}"})[1]["uuid"]
@@ -364,7 +375,7 @@ def scenario_liaisons():
     check("[liaisons] annonce mDNS de la Grange simulée", z.get("type") == "form", json.dumps(z))
     hl.ws_close()
     answers = {"target": "105", "snapshot_before": False, "login_password": PWD,
-               "liaison.known": [R_URL], "liaison.add": False, "liaison.username": "richard",
+               "liaison.known": [R_URL], "liaison.username": "richard",
                "liaison.password": PWD, "liaison.local_only": True, "summary": "ok", "snapshot_after": False}
     out = run_script("liaisons", answers, args=["--liaisons"])
     users = {u["username"]: u for u in g.call("config/auth/list") if u.get("username")}
@@ -403,7 +414,17 @@ def scenario_liaisons():
     check("[liaisons] relance : « déjà reliée », ni doublon de liaison ni de compte",
           "Grange (déjà reliée)" in out and len([e for e in entries if e["domain"] == "remote_homeassistant"]) == 1
           and len(users2) == 1, out[-600:])
-    # ajouter une liaison « reprise » : le compte existe déjà → mot de passe renouvelé, pas de doublon (propriétaire)
+    # reprise après un essai interrompu : compte et jeton existent déjà là-bas, liaison absente ici
+    e = next(x for x in ha_session().entries("remote_homeassistant"))
+    hd = ha_session()
+    hd.call("config_entries/delete", entry_id=e["entry_id"]) if False else hd.req("DELETE", f"/api/config/config_entries/entry/{e['entry_id']}")
+    hd.ws_close()
+    out = run_script("liaisons3", dict(answers, **{"liaison.known": [], "liaison.add": [True, False],
+                                                   "liaison.url": R_URL}), args=["--liaisons"])
+    titles = [x["title"] for x in ha_session().entries("remote_homeassistant")]
+    users3 = [u for u in g.call("config/auth/list") if (u.get("username") or "").startswith("liaison-")]
+    check("[liaisons] reprise après essai interrompu : ancien jeton remplacé, liaison recréée, un seul compte",
+          titles == ["Grange"] and len(users3) == 1 and "already exists" not in out, out[-700:])
     ha.ws_close()
     g.ws_close()
 

@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -550,6 +550,7 @@ class HA:
         self.expires = 0.0
         self.ws: WebSocket | None = None
         self.msg_id = 0
+        self.last_io = 0.0
 
     # -- authentification --
     def _store_tokens(self, payload):
@@ -650,6 +651,7 @@ class HA:
         if res.get("type") != "auth_ok":
             raise HAError("ws", f"authentification refusée : {res.get('message')}")
         self.ws = ws
+        self.last_io = time.time()
 
     def ws_close(self):
         if self.ws:
@@ -657,7 +659,11 @@ class HA:
             self.ws = None
 
     def send_only(self, payload: dict) -> int:
+        if self.ws and time.time() - self.last_io > 20:
+            # HA coupe une connexion qui ne répond pas à ses « ping » (pendant une saisie, par exemple)
+            self.ws_close()
         self.ws_connect()
+        self.last_io = time.time()
         self.msg_id += 1
         payload = dict(payload, id=self.msg_id)
         self.ws.send(json.dumps(payload))
@@ -681,6 +687,7 @@ class HA:
                 raise HAError("timeout", f"{type_} : pas de réponse en {int(wait)} s")
             try:
                 raw = self.ws.recv(min(left, 30))
+                self.last_io = time.time()
             except socket.timeout:
                 continue
             except (WSClosed, OSError) as e:
@@ -2190,16 +2197,23 @@ class Bootstrap:
         targets = []
         self.ui.say("Recherche des autres instances (réseau local, ce serveur Proxmox, instances déjà vues)…")
         cands = self.discover_instances()
+        add_more = not cands
         if cands:
-            items = [(base, f"{name} ({base})" + (" — déjà reliée" if name in titles else ""), name not in titles)
-                     for base, name in cands.items()]
-            targets += self.ui.checklist("liaison.known", "Relier à…",
-                                         f"Instances trouvées. Coche celles que {self.instance_name} doit voir :", items)
-        while self.ui.yesno("liaison.add", "Relier à une autre instance",
-                            ("Choisies : " + ", ".join(cands.get(t, t) for t in targets) + "\n\n" if targets else "")
-                            + ("Une instance manque à la liste ? Ajouter son adresse ?" if cands
-                               else "Aucune instance trouvée automatiquement. Ajouter une adresse ?"),
-                            default=not cands):
+            items = [(base, label + (" — déjà reliée" if label.split(" ·")[0] in titles else ""),
+                      label.split(" ·")[0] not in titles and "· VM" not in label)
+                     for base, label in cands.items()]
+            items.append(("+", "➕ Ajouter une autre adresse…", False))
+            picked = self.ui.checklist("liaison.known", "Relier à…",
+                                       f"Instances trouvées. Coche celles que {self.instance_name} doit voir.\n"
+                                       "Le vrai nom de chacune est vérifié à la connexion.", items)
+            add_more = "+" in picked
+            targets += [t for t in picked if t != "+"]
+        first = True
+        while add_more and self.ui.yesno("liaison.add", "Relier à une autre instance",
+                            ("Choisies : " + ", ".join(targets) + "\n\n" if targets else "")
+                            + ("Ajouter l'adresse d'une instance ?" if first else "Ajouter encore une autre adresse ?"),
+                            default=first):
+            first = False
             url = self.ui.ask("liaison.url", "Adresse de l'autre instance",
                               "Adresse locale, telle qu'on l'ouvre dans le navigateur\n"
                               "(ex. http://10.20.20.126:8123, ou http://10.10.1.108 si elle est sur le port 80) :",
@@ -2251,7 +2265,7 @@ class Bootstrap:
                     port = d.get("port") or (443 if scheme == "https" else 80)
                     base = f"{scheme}://{d['host']}" + ("" if port in (80, 443) else f":{port}")
                     name = ((f.get("context") or {}).get("title_placeholders") or {}).get("name") or d["host"]
-                    found[base] = name
+                    found[base] = f"{name} · annoncée sur le réseau"
         except HAError as e:
             LOG.write(f"découverte mDNS : {e}")
         # 2. autres VM de ce serveur Proxmox qui font tourner Home Assistant
@@ -2267,12 +2281,12 @@ class Bootstrap:
                     for ip in ips[:2]:
                         base = self.quick_probe(ip)
                         if base and base not in found:
-                            found[base] = f"VM {vm['vmid']} {vm['name']}"
+                            found[base] = f"Home Assistant · VM {vm['vmid']} « {vm['name']} » de ce Proxmox"
             except (RuntimeError, OSError, subprocess.TimeoutExpired):
                 pass
         # 3. instances déjà préparées depuis ce serveur
         for i in self.conf.get("instances", []):
-            found.setdefault(i["base"], i["name"])
+            found.setdefault(i["base"], f"{i['name']} · préparée depuis ce serveur")
         return {b: n for b, n in found.items()
                 if urllib.parse.urlparse(b).hostname != me.hostname or urllib.parse.urlparse(b).port != me.port}
 
@@ -2347,7 +2361,11 @@ class Bootstrap:
             res = t.login(account, lpwd)
             if res is not None:
                 raise HAError("liaison", f"le compte {account} ne peut pas se connecter à {name} ({res})")
-            token = t.call("auth/long_lived_access_token", client_name=f"Remote HA ({self.instance_name})", lifespan=3650)
+            client_name = f"Remote HA ({self.instance_name})"
+            for tk in t.call("auth/refresh_tokens") or []:  # jetons d'un essai précédent : retirés
+                if tk.get("type") == "long_lived_access_token" and tk.get("client_name") == client_name:
+                    t.call("auth/delete_refresh_token", refresh_token_id=tk["id"])
+            token = t.call("auth/long_lived_access_token", client_name=client_name, lifespan=3650)
             LOG.hide(token)
             try:
                 for tk in t.call("auth/refresh_tokens") or []:
