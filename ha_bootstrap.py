@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -242,13 +242,14 @@ class UI:
             print(f"\n== {title} ==\n{text}\n")
             input("[Entrée pour continuer] ")
 
-    def yesno(self, key: str, title: str, text: str, default: bool = True) -> bool:
+    def yesno(self, key: str, title: str, text: str, default: bool = True,
+              yes: str = "Oui", no: str = "Non") -> bool:
         if self.scripted:
             v = self._scripted(key, default)
             return bool(v) if not isinstance(v, str) else v.lower() in ("1", "o", "oui", "y", "yes", "true")
         if self.whip:
             h, w = self._size(text)
-            args = ["--title", title, "--yes-button", "Oui", "--no-button", "Non"]
+            args = ["--title", title, "--yes-button", yes, "--no-button", no]
             if not default:
                 args.append("--defaultno")
             rc, _ = self._whip(args + ["--yesno", text, h, w])
@@ -1042,13 +1043,12 @@ class Bootstrap:
         print(f"\n\033[1;33m{bar}\n  ⚠  MOTS DE PASSE À NOTER MAINTENANT (enregistrés nulle part)\n{bar}\033[0m\n"
               f"{block}\n\033[1;33m{bar}\033[0m\n", flush=True)
         self.revealed += [i for i in items if i not in self.revealed]
-        while True:
-            v = self.ui.ask(f"{key}.noted", "⚠ MOTS DE PASSE À NOTER MAINTENANT",
-                            f"{block}\n\nIls ne sont enregistrés nulle part : note-les tout de suite\n"
-                            "(gestionnaire de mots de passe), puis tape  noté  et Valider.",
-                            default="noté" if self.ui.scripted else "", allow_empty=True)
-            if v.strip().lower().rstrip(".!") in ("noté", "note", "noter", "c'est noté"):
-                return
+        while not self.ui.yesno(f"{key}.noted", "⚠ MOTS DE PASSE À NOTER MAINTENANT",
+                                f"{block}\n\nIls ne sont enregistrés nulle part.\n"
+                                "Note-les maintenant dans ton gestionnaire de mots de passe.\n\n"
+                                "As-tu bien tout noté ?",
+                                default=self.ui.scripted, yes="C'est noté", no="Pas encore"):
+            pass
 
     # -- exécution d'une étape avec reprise --
     def run_step(self, sid: str, title: str, fn) -> bool:
