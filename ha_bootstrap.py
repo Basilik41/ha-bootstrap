@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 CONF_DIR = os.environ.get("HAB_CONF_DIR") or os.path.join(os.path.expanduser("~"), ".config", "ha-bootstrap")
 CF_API = os.environ.get("HAB_CF_API", "https://api.cloudflare.com/client/v4")
@@ -455,7 +455,7 @@ class WebSocket:
         lines = head.decode("latin-1").split("\r\n")
         if " 101 " not in lines[0] + " ":
             raise WSClosed(f"refus WebSocket : {lines[0]}")
-        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(), usedforsecurity=False).digest()).decode()
         hdrs = {l.split(":", 1)[0].strip().lower(): l.split(":", 1)[1].strip() for l in lines[1:] if ":" in l}
         if hdrs.get("sec-websocket-accept") != accept:
             raise WSClosed("clé WebSocket invalide")
